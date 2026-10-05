@@ -1,0 +1,12 @@
+# Build output
+bridge/build*/
+fs-mod/dist/
+
+# The MOZA SDK is MOZA's to distribute; see "Getting the MOZA SDK" in README.md
+sdk/
+
+# Written next to the bridge at run time
+*.ini
+devsdk.log
+
+.DS_Store

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8" standalone="no" ?>
+<modDesc descVersion="111">
+    <author>moza-farmsim-link</author>
+    <version>0.1.0.0</version>
+    <title>
+        <en>MOZA Yoke Link</en>
+    </title>
+    <description>
+        <en><![CDATA[Writes live telemetry of the vehicle you are driving (speed, steering, mass, engine, wheel slip, ground surface, implement state) to modSettings/FS25_MozaYokeLink/telemetry.txt, for the moza-farmsim-link bridge that drives force feedback on a MOZA flight yoke.
+
+While loaded it also stops the game from sending its own steering force feedback, so the game and the bridge do not fight over the device.
+
+Has no effect in the game itself. PC only.]]></en>
+    </description>
+    <iconFilename>icon_MozaYokeLink.dds</iconFilename>
+    <multiplayer supported="true"/>
+    <extraSourceFiles>
+        <sourceFile filename="scripts/MozaTelemetry.lua"/>
+        <sourceFile filename="scripts/MozaYokeLink.lua"/>
+    </extraSourceFiles>
+</modDesc>
