@@ -221,3 +221,8 @@ cmake -S bridge -B bridge/build -G Ninja && cmake --build bridge/build && ctest 
 ```
 
 Pass `-DBRIDGE_FAKE_SDK=ON` to do the same on Windows.
+
+## License
+
+MIT; see `LICENSE`. That covers this repository's code. The MOZA SDK it builds against is MOZA's
+and is not included.
