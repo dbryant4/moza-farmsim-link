@@ -5,7 +5,8 @@
 --
 -- Covers the telemetry line (docs/telemetry.md), the gathering code against a
 -- mocked tractor with implements, the write-rate limiter, the engine layer
--- (file output, pause, failure handling) and the force feedback override.
+-- (file output, pause, failure handling), the bridge presence file and the
+-- force feedback override that follows it.
 --
 
 local realIo, realOs, realPrint = io, os, print
@@ -892,6 +893,122 @@ test("a change of state writes at once; odd dt values are harmless", function()
     eq(T.throttleStep(state, 16, false), false, "does not bank the long frame")
 end)
 
+realPrint("bridge presence rules")
+
+test("bridgeBeat accepts only version 1 with a positive whole beat", function()
+    eq(T.bridgeBeat(1, 4821), 4821, "the contract's example")
+    eq(T.bridgeBeat(1, 1), 1)
+    eq(T.bridgeBeat(1, 2147483647), 2147483647)
+    eq(T.bridgeBeat(2, 4821), nil, "another format version")
+    eq(T.bridgeBeat(0, 4821), nil) eq(T.bridgeBeat(nil, 4821), nil, "no version") eq(T.bridgeBeat("1", 4821), nil, "version as text")
+    eq(T.bridgeBeat(1, 0), nil, "beat is positive") eq(T.bridgeBeat(1, -3), nil) eq(T.bridgeBeat(1, 1.5), nil)
+    eq(T.bridgeBeat(1, nil), nil, "no beat") eq(T.bridgeBeat(1, "12"), nil) eq(T.bridgeBeat(1, {}), nil)
+    eq(T.bridgeBeat(1, 0 / 0), nil, "NaN") eq(T.bridgeBeat(1, math.huge), nil, "inf")
+    eq(T.bridgeBeat(nil, nil), nil)
+end)
+
+--- Feed a presence tracker one read per second.
+local function reads(state, tokens)
+    local present
+    for _, token in ipairs(tokens) do
+        if token == "none" then
+            token = nil
+        end
+        T.presenceTick(state, 1000)
+        present = T.presenceObserve(state, token)
+    end
+    return present
+end
+
+test("present from the moment the beat is seen to change", function()
+    local state = T.newPresence()
+    eq(state.present, false, "starts absent")
+    eq(reads(state, { 10 }), false, "one read proves nothing")
+    eq(reads(state, { 12 }), true, "changed: present")
+    eq(reads(state, { 14, 16, 18 }), true, "keeps changing")
+    eq(reads(state, { 3 }), true, "a beat that went down is still a change (the bridge restarted)")
+
+    -- a file left behind by a crash never changes, so it never counts
+    state = T.newPresence()
+    eq(reads(state, { 500, 500, 500, 500, 500, 500, 500, 500, 500, 500 }), false, "stale file")
+
+    -- anything that is not a beat is not a change
+    state = T.newPresence()
+    eq(reads(state, { 1, {}, true, 1 }), false, "junk is not a change")
+end)
+
+test("absent again after three seconds without a change, or at once when the file is gone", function()
+    local state = T.newPresence()
+    reads(state, { 10, 12 })
+    eq(reads(state, { 12 }), true, "1 s unchanged")
+    eq(reads(state, { 12 }), true, "2 s unchanged")
+    eq(reads(state, { 12 }), false, "3 s unchanged")
+    eq(reads(state, { 12, 12 }), false, "stays absent")
+    eq(reads(state, { 13 }), true, "beating again")
+
+    -- reads that return nothing usable count as "not changed"
+    eq(reads(state, { "none", "none" }), true, "2 s of unreadable reads")
+    eq(reads(state, { 14 }), true, "and then a change: never dropped")
+    eq(reads(state, { "none", "none", "none" }), false, "3 s of unreadable reads")
+
+    -- the file is gone
+    state = T.newPresence()
+    reads(state, { 10, 12 })
+    eq(reads(state, { T.FILE_GONE }), false, "gone: absent at once")
+    eq(reads(state, { 50 }), false, "back: one read proves nothing, whatever the beat was before")
+    eq(reads(state, { 51 }), true)
+end)
+
+test("a change measured against an old read does not count", function()
+    -- not present: the two differing reads are too far apart to show the bridge is writing now
+    local state = T.newPresence()
+    eq(reads(state, { 10, "none", "none", "none", "none", 11 }), false, "five seconds apart")
+    eq(reads(state, { 12 }), true, "a second change a second later does")
+
+    -- present, then the game stands still for a minute (no reads, time passes)
+    state = T.newPresence()
+    reads(state, { 10, 12 })
+    T.presenceTick(state, 60000, true)
+    eq(T.presenceObserve(state, 12), false, "unchanged across the gap: absent at the first read")
+
+    state = T.newPresence()
+    reads(state, { 10, 12 })
+    T.presenceTick(state, 60000, true)
+    eq(T.presenceObserve(state, 130), true, "changed across the gap: one more read to prove itself")
+    eq(reads(state, { 130 }), false, "it did not change again: absent after that one read")
+
+    state = T.newPresence()
+    reads(state, { 10, 12 })
+    T.presenceTick(state, 60000, true)
+    T.presenceObserve(state, 130)
+    eq(reads(state, { 132, 134, 134, 134 }), true, "it did: carries on as before, with the full three seconds")
+    eq(reads(state, { 134 }), false)
+end)
+
+test("presenceTick asks for a read about once a second", function()
+    for _, fps in ipairs({ 20, 30, 60, 144, 240 }) do
+        local state, dt, due = T.newPresence(), 1000 / fps, 0
+        for _ = 1, fps * 20 do
+            if T.presenceTick(state, dt) then
+                due = due + 1
+            end
+        end
+        check(due >= 20 and due <= 21, fps .. " fps: " .. due .. " reads in 20 s")
+    end
+
+    local state = T.newPresence()
+    eq(T.presenceTick(state, 16), true, "the first frame reads")
+    eq(T.presenceTick(state, 16), false)
+    eq(T.presenceTick(state, 16, true), true, "forced")
+    eq(T.presenceTick(state, 0 / 0), false, "NaN dt")
+    eq(T.presenceTick(state, -500), false, "negative dt")
+    eq(T.presenceTick(state, nil), false, "nil dt")
+    eq(T.presenceTick(state, 999), false, "not quite a second since the last read")
+    eq(T.presenceTick(state, 1), true)
+    eq(T.presenceTick(state, 600000), true, "a very long frame")
+    eq(T.presenceTick(state, 16), false, "is not banked")
+end)
+
 ---------------------------------------------------------------------------
 -- engine layer: MozaYokeLink.lua with mocked engine functions
 ---------------------------------------------------------------------------
@@ -903,6 +1020,11 @@ local listeners = {}
 local createdFolders = {}
 local profileDir = tmpRoot .. "/profile/"
 local telemetryPath = profileDir .. "modSettings/FS25_MozaYokeLink/telemetry.txt"
+local bridgePath = profileDir .. "modSettings/FS25_MozaYokeLink/bridge.xml"
+local oldBridgePath = profileDir .. "modSettings/FS25_MozaYokeLink/bridge.txt" -- the first presence file; no longer used
+local xml -- counters of the mocked XML API, reset by loadMod
+local mockXmlClass -- defined below
+local clockSec = nil -- wall clock behind the mocked getTimeSec, when a test uses one
 
 local function logText()
     return table.concat(logs, "\n")
@@ -948,6 +1070,14 @@ local function loadMod(opts)
     g_dedicatedServer, g_dedicatedServerInfo = nil, nil
     g_currentModSettingsDirectory = nil
     getNumOfGamepads, getGamepadName, getGamepadCategory, getHasGamepadAxisForceFeedback, Input = nil, nil, nil, nil, nil
+    getTimeSec = nil
+    clockSec = nil
+    loadXMLFile, getXMLInt = nil, nil
+    if opts.noXml then
+        fileExists, XMLFile = nil, nil
+    else
+        mockXmlClass()
+    end
 
     -- the game's input binding class, as Drivable uses it
     local yoke = { deviceName = "MOZA AY210 Base", category = 3, calls = {} }
@@ -990,22 +1120,252 @@ local function fileValues()
     return checkLine(text), text
 end
 
+--- One frame of the mocked game.
+local function frame(mod, dt)
+    if clockSec ~= nil then
+        clockSec = clockSec + dt / 1000
+    end
+    if g_currentMission.paused ~= true then
+        g_currentMission.time = g_currentMission.time + dt
+    end
+    mod:update(dt)
+end
+
 local function drive(mod, vehicle, frames, dt)
     g_localPlayer = { getCurrentVehicle = function() return vehicle end }
     for _ = 1, frames do
-        g_currentMission.time = g_currentMission.time + (dt or 1000 / 60)
-        mod:update(dt or 1000 / 60)
+        frame(mod, dt or 1000 / 60)
     end
 end
 
-local originalFfbFunction
+--- Let the game run for `ms` without changing who drives what.
+local function run(mod, ms, dt)
+    dt = dt or 1000 / 60
+    for _ = 1, math.floor(ms / dt + 0.5) do
+        frame(mod, dt)
+    end
+end
+
+-- the bridge's side of the presence file
+local function writeBridge(text)
+    local f = realIo.open(bridgePath, "wb")
+    check(f ~= nil, "cannot write " .. bridgePath)
+    f:write(text)
+    f:close()
+end
+
+local function bridgeXml(beat, version)
+    return '<?xml version="1.0" encoding="utf-8" standalone="no"?>\n<bridge version="' .. (version or 1) .. '" beat="' .. beat .. '"/>\n'
+end
+
+local function writeBeat(beat)
+    writeBridge(bridgeXml(beat))
+end
+
+local function removeBridge()
+    realOs.remove(bridgePath)
+end
+
+--- Let the game run for `ms` next to a bridge that beats twice a second.
+-- @return the last beat written
+local function runWithBridge(mod, ms, beat, dt, write)
+    dt = dt or 1000 / 60
+    write = write or writeBeat
+    local sinceBeat = 500
+    for _ = 1, math.floor(ms / dt + 0.5) do
+        if sinceBeat >= 500 then
+            sinceBeat = sinceBeat - 500
+            beat = beat + 1
+            write(beat)
+        end
+        frame(mod, dt)
+        sinceBeat = sinceBeat + dt
+    end
+    return beat
+end
+
+--- Start a bridge and run until the mod has noticed it. @return the last beat
+local function bridgeUp(mod, beat)
+    return runWithBridge(mod, 2600, beat or 100)
+end
+
+local steeringBinding = { deviceId = "yoke", axisNames = { "AXIS_1" } }
+
+--- What the game's steering code would be told about force feedback right now.
+local function ask(binding)
+    return g_inputBinding:getBindingForceFeedbackInfo(binding or steeringBinding)
+end
+
+--- The force feedback part of the game's Drivable.actionEventSteer.
+local function gameSteeringEvent(vehicle, binding, inputValue)
+    local state = vehicle.spec_drivable.forceFeedback
+    if not state.isActive then
+        local isSupported, device, axisIndex = g_inputBinding:getBindingForceFeedbackInfo(binding)
+        state.isActive = isSupported
+        state.device = device
+        state.binding = binding
+        state.axisIndex = axisIndex
+        if isSupported then
+            device:setForceFeedback(axisIndex, 0, inputValue)
+        end
+    elseif binding ~= state.binding then
+        local isSupported = g_inputBinding:getBindingForceFeedbackInfo(binding)
+        if not isSupported then
+            state.isActive = false
+            state.device = nil
+            state.binding = nil
+            state.axisIndex = 0
+        end
+    end
+end
+
+--- An io library like the game's own (dataS/scripts/io.lua): open, and file
+-- objects with write, close and flush. Whatever mode is asked for, the file is
+-- opened for writing, and so emptied.
+local function gameLikeIo(calls)
+    local lib = {}
+    function lib.open(filename, options)
+        calls[#calls + 1] = { filename, options }
+        local f = realIo.open(filename, "w")
+        if f == nil then
+            return nil
+        end
+        local object = {}
+        function object:write(...) f:write(...) end
+        function object:close() f:close() end
+        function object:flush() end
+        return object
+    end
+    return lib
+end
+
+-- The game's XML reading, mocked over real files -----------------------------
+
+--- Enough of an XML parser for the presence file: an optional declaration and
+-- one empty root element with attributes. nil for anything else, as a failed load.
+local function parseXml(text)
+    if type(text) ~= "string" then
+        return nil
+    end
+    local body = text:gsub("^%s*<%?xml.-%?>%s*", "")
+    local name, attributes = body:match("^<([%a_][%w_]*)(.-)/>%s*$")
+    if name == nil then
+        return nil
+    end
+    local values = {}
+    for key, value in attributes:gmatch('([%a_][%w_]*)="([^"]*)"') do
+        values[key] = value
+    end
+    return { name = name, attributes = values }
+end
+
+--- getXMLInt: nil when the element or attribute is missing or not a number; decimals cut off.
+local function xmlInt(doc, path)
+    local root, attribute = path:match("^([%w_]+)#([%w_]+)$")
+    if root == nil or doc.name ~= root then
+        return nil
+    end
+    local n = tonumber(doc.attributes[attribute])
+    if n == nil then
+        return nil
+    end
+    return n >= 0 and math.floor(n) or math.ceil(n)
+end
+
+local function mockFileExists()
+    fileExists = function(path)
+        xml.existsCalls = xml.existsCalls + 1
+        xml.existsPaths[path] = true
+        local f = realIo.open(path, "rb")
+        if f == nil then
+            return false
+        end
+        f:close()
+        return true
+    end
+end
+
+local function resetXmlCounters()
+    xml = { existsCalls = 0, existsPaths = {}, loads = 0, loadPaths = {}, open = 0, freed = 0, maxOpen = 0 }
+end
+
+local function loaded(path)
+    xml.loads = xml.loads + 1
+    xml.loadPaths[path] = true
+    local doc = parseXml(readFile(path))
+    if doc ~= nil then
+        xml.open = xml.open + 1
+        xml.maxOpen = math.max(xml.maxOpen, xml.open)
+    end
+    return doc
+end
+
+--- The XMLFile class, as mods use it: XMLFile.loadIfExists, xmlFile:getInt, xmlFile:delete.
+mockXmlClass = function()
+    resetXmlCounters()
+    mockFileExists()
+    XMLFile = {}
+    function XMLFile.loadIfExists(objectName, filename)
+        check(type(objectName) == "string" and objectName ~= "", "XMLFile.loadIfExists needs an object name")
+        local doc = loaded(filename)
+        if doc == nil then
+            return nil
+        end
+        local object, deleted = {}, false
+        function object:getInt(path, default)
+            check(not deleted, "getInt on a deleted XML file")
+            if xml.getIntError then
+                error(xml.getIntError)
+            end
+            local value = xmlInt(doc, path)
+            if value == nil then
+                return default
+            end
+            return value
+        end
+        function object:delete()
+            check(not deleted, "XML file deleted twice")
+            deleted = true
+            xml.open = xml.open - 1
+            xml.freed = xml.freed + 1
+        end
+        return object
+    end
+end
+
+--- Only the engine functions underneath: loadXMLFile, getXMLInt, delete.
+local function mockXmlFunctions()
+    resetXmlCounters()
+    mockFileExists()
+    XMLFile = nil
+    local docs, nextHandle = {}, 100
+    loadXMLFile = function(objectName, filename)
+        local doc = loaded(filename)
+        if doc == nil then
+            return 0
+        end
+        nextHandle = nextHandle + 1
+        docs[nextHandle] = doc
+        return nextHandle
+    end
+    getXMLInt = function(handle, path)
+        check(docs[handle] ~= nil, "getXMLInt on a handle that is not open")
+        return xmlInt(docs[handle], path)
+    end
+    delete = function(handle)
+        check(docs[handle] ~= nil, "delete of a handle that is not open")
+        docs[handle] = nil
+        xml.open = xml.open - 1
+        xml.freed = xml.freed + 1
+    end
+end
 
 test("the script registers one listener and logs its version", function()
     local mod = loadMod()
     eq(#listeners, 1) eq(listeners[1], mod)
     check(type(mod.loadMap) == "function" and type(mod.update) == "function" and type(mod.deleteMap) == "function", "listener functions")
     eq(countLogs("^%[MozaYokeLink%] version " .. mod.VERSION:gsub("%.", "%%.") .. " script loaded$"), 1)
-    eq(mod.VERSION, "0.1.0.0", "matches modDesc.xml")
+    eq(mod.VERSION, "0.1.1.0", "matches modDesc.xml")
     eq(mod.suppressGameForceFeedback, true, "the switch defaults to on")
     unloadMod()
 end)
@@ -1244,53 +1604,537 @@ test("dedicated server: disabled, nothing written", function()
     unloadMod()
 end)
 
-realPrint("force feedback override")
+realPrint("bridge presence and the force feedback override")
 
-test("switch on: the game is told that steering has no force feedback", function()
+local DETECTED = "^%[MozaYokeLink%] bridge detected: suppressing the game's steering force feedback$"
+local GONE = "^%[MozaYokeLink%] bridge gone: the game's steering force feedback is back in its hands$"
+
+--- Every XML file that was loaded has been freed again.
+local function checkHandles()
+    eq(xml.open, 0, "XML files left open")
+    check(xml.maxOpen <= 1, "more than one XML file open at a time")
+end
+
+test("no bridge: every call goes to the game's function and its answer comes back unchanged", function()
     local mod, yoke = loadMod()
-    local original = InputBinding.getBindingForceFeedbackInfo
-    local binding = { deviceId = "yoke", axisNames = { "AXIS_1" } }
-    local a, b, c = g_inputBinding:getBindingForceFeedbackInfo(binding)
-    eq(a, true, "before loadMap the game's own answer stands") eq(b, yoke)
+    local seen = {}
+    local original = function(self, binding, extra)
+        seen[#seen + 1] = { self, binding, extra }
+        if binding == nil then
+            return false, nil, 0
+        end
+        return true, yoke, 3, "fourth value"
+    end
+    InputBinding.getBindingForceFeedbackInfo = original
 
     mod:loadMap("map")
-    check(InputBinding.getBindingForceFeedbackInfo ~= original, "override installed")
-    a, b, c = g_inputBinding:getBindingForceFeedbackInfo(binding)
-    eq(a, false, "isSupported") eq(b, nil, "device") eq(c, 0, "axisIndex")
-    eq(select("#", g_inputBinding:getBindingForceFeedbackInfo(binding)), 3, "same shape as the original: three values")
-    eq(countLogs("game force feedback suppressed: getBindingForceFeedbackInfo overridden on InputBinding class"), 1)
+    check(InputBinding.getBindingForceFeedbackInfo ~= original, "wrapper installed")
+    eq(countLogs("force feedback override installed on InputBinding class; the game keeps its steering force feedback until the bridge shows up in .*modSettings/FS25_MozaYokeLink/bridge%.xml %(checked with XMLFile%.loadIfExists%)$"), 1)
+    eq(countLogs("suppress"), 0, "nothing claims suppression at load")
 
-    -- the first call also logs what the game itself would have answered
-    eq(countLogs("game asked about steering force feedback: device 'MOZA AY210 Base' category=3 axis=0 supported=true %-> suppressed"), 1)
+    drive(mod, newContractScene(), 600) -- ten seconds, no bridge.xml
+    local a, b, c, d = g_inputBinding:getBindingForceFeedbackInfo(steeringBinding, "extra argument")
+    eq(a, true) eq(b, yoke) eq(c, 3) eq(d, "fourth value")
+    eq(select("#", g_inputBinding:getBindingForceFeedbackInfo(steeringBinding)), 4, "every return value is handed back")
+    local last = seen[#seen - 1]
+    eq(last[1], g_inputBinding, "self") eq(last[2], steeringBinding, "binding") eq(last[3], "extra argument", "extra arguments")
+    a, b, c = g_inputBinding:getBindingForceFeedbackInfo(nil)
+    eq(a, false) eq(b, nil) eq(c, 0)
+    eq(select("#", g_inputBinding:getBindingForceFeedbackInfo(nil)), 3)
+
+    -- the game's function is called exactly once per call, also after the first 200
+    local before = #seen
     for _ = 1, 500 do
-        g_inputBinding:getBindingForceFeedbackInfo(binding)
+        ask()
     end
-    eq(countLogs("game asked about steering force feedback"), 1, "logged once, not per call")
+    eq(#seen, before + 500)
+
+    eq(countLogs(DETECTED), 0) eq(countLogs(GONE), 0)
+    eq(countLogs("game asked about steering force feedback: device 'MOZA AY210 Base' category=3 axis=3 supported=true %-> left to the game %(no bridge%)$"), 1)
+    eq(countLogs("game asked about steering force feedback"), 2, "one line per distinct answer, not per call")
+
+    -- no file: fileExists is asked about once a second and the XML loader never
+    check(xml.existsCalls >= 10 and xml.existsCalls <= 11, "fileExists calls in ten seconds: " .. xml.existsCalls)
+    eq(xml.loads, 0, "no XML load is attempted for a file that is not there")
+    eq(readFile(bridgePath), nil, "the mod does not create bridge.xml")
+    eq(countLogs("problem:"), 0)
+    mod:deleteMap()
+    eq(InputBinding.getBindingForceFeedbackInfo, original, "restored")
+    unloadMod()
+end)
+
+test("bridge beating: suppressed from the second read, logged once", function()
+    local mod, yoke = loadMod()
+    local original = InputBinding.getBindingForceFeedbackInfo
+    mod:loadMap("map")
+
+    writeBeat(100)
+    run(mod, 50)
+    eq((ask()), true, "one read of the file proves nothing yet")
+    eq(countLogs(DETECTED), 0)
+
+    local beat = runWithBridge(mod, 1100, 100)
+    local a, b, c = ask()
+    eq(a, false, "isSupported") eq(b, nil, "device") eq(c, 0, "axisIndex")
+    eq(select("#", ask()), 3, "the shape the game expects: three values")
+    eq(countLogs(DETECTED), 1)
+    eq(mod.isSuppressing(), true)
+
+    beat = runWithBridge(mod, 20000, beat)
+    eq((ask()), false, "still suppressed after twenty seconds")
+    eq(countLogs(DETECTED), 1, "one line per transition, nothing per second")
+    eq(countLogs(GONE), 0)
+    eq(countLogs("game asked about steering force feedback: device 'MOZA AY210 Base' category=3 axis=0 supported=true %-> suppressed %(bridge running%)$"), 1)
+    for _ = 1, 500 do
+        ask()
+    end
+    eq(countLogs("game asked about steering force feedback"), 2, "one line while passed through, one while suppressed")
+    eq(readFile(bridgePath), bridgeXml(beat), "the mod leaves bridge.xml alone")
+    checkHandles()
+    check(xml.freed >= 21 and xml.freed <= 23, "one load per second, each freed: " .. xml.freed)
 
     mod:deleteMap()
-    eq(InputBinding.getBindingForceFeedbackInfo, original, "original restored on unload")
-    a, b = g_inputBinding:getBindingForceFeedbackInfo(binding)
-    eq(a, true) eq(b, yoke)
+    eq(InputBinding.getBindingForceFeedbackInfo, original, "original restored on unload, bridge or not")
+    eq((ask()), true)
     eq(countLogs("game force feedback override removed"), 1)
     unloadMod()
 end)
 
-test("switch off: the game's function is left alone", function()
+test("beat frozen for three seconds: back to the game, logged once; a returning bridge is picked up again", function()
+    local mod = loadMod()
+    mod:loadMap("map")
+    local beat = bridgeUp(mod)
+    eq((ask()), false)
+
+    run(mod, 2400) -- the bridge has stopped writing; its file is still there
+    eq((ask()), false, "2.4 s without a change: still suppressed")
+    eq(countLogs(GONE), 0)
+    run(mod, 1700)
+    eq((ask()), true, "more than three seconds (plus one read): the game's answer again")
+    eq(countLogs(GONE), 1)
+    eq(mod.isSuppressing(), false)
+
+    run(mod, 30000) -- the stale file stays
+    eq((ask()), true)
+    eq(countLogs(GONE), 1) eq(countLogs(DETECTED), 1)
+    eq(countLogs("bridge%.xml is there but its beat is not changing"), 1, "one hint about the stale file")
+
+    runWithBridge(mod, 2600, beat + 50)
+    eq((ask()), false, "the bridge is back")
+    eq(countLogs(DETECTED), 2)
+    eq(countLogs("problem:"), 0)
+    checkHandles()
+    unloadMod()
+end)
+
+test("file disappears: back to the game at the next read", function()
+    local mod = loadMod()
+    mod:loadMap("map")
+    bridgeUp(mod)
+    eq((ask()), false)
+    removeBridge() -- the bridge stopped cleanly
+    local loads = xml.loads
+    run(mod, 1100)
+    eq((ask()), true, "no three second wait when the file is gone")
+    eq(countLogs(GONE), 1)
+    run(mod, 10000)
+    eq(countLogs(GONE), 1) eq(countLogs(DETECTED), 1)
+    eq(countLogs("is there but"), 0)
+    eq(xml.loads, loads, "fileExists says no: the XML loader is not asked")
+    checkHandles()
+    unloadMod()
+end)
+
+test("a file left behind by a crash never counts", function()
+    local mod = loadMod()
+    mod:loadMap("map")
+    writeBeat(4821)
+    drive(mod, newContractScene(), 1800) -- thirty seconds
+    eq((ask()), true)
+    eq(countLogs(DETECTED), 0) eq(countLogs(GONE), 0)
+    eq(countLogs("bridge%.xml is there but its beat is not changing %(left over from an earlier run of the bridge%): the bridge counts as not running$"), 1)
+    eq(readFile(bridgePath), bridgeXml(4821), "left as it was")
+    checkHandles()
+    unloadMod()
+end)
+
+test("files that are not a version 1 presence file are ignored", function()
+    local mod = loadMod()
+    mod:loadMap("map")
+    local junk = {
+        function(n) return bridgeXml(n, 2) end,                                  -- another format version
+        function(n) return '<bridge beat="' .. n .. '"/>\n' end,                 -- no version
+        function(n) return '<bridge version="1"/>\n' end,                        -- no beat
+        function(n) return '<bridge version="1" beat="0"/>\n' end,               -- beat is positive
+        function(n) return '<bridge version="1" beat="-' .. n .. '"/>\n' end,
+        function(n) return '<bridge version="1" beat="beat' .. n .. '"/>\n' end, -- not a number
+        function(n) return '<other version="1" beat="' .. n .. '"/>\n' end,      -- another root element
+        function(n) return '<bridge version="1" beat="' .. n .. '"' end,         -- not well formed: the load fails
+        function(n) return "MOZAFS-BRIDGE 1 beat=" .. n .. " end=1\n" end,       -- the text format of 0.1.1 drafts
+        function(n) return "" end,
+    }
+    local function writeJunk(n)
+        writeBridge(junk[n % #junk + 1](n))
+    end
+
+    -- junk that changes all the time is not a beat
+    local n = runWithBridge(mod, 12000, 0, nil, writeJunk)
+    eq((ask()), true)
+    eq(countLogs(DETECTED), 0)
+    eq(countLogs("bridge%.xml is there but XMLFile%.loadIfExists gets no beat from it %(not version 1 of the bridge's format, or not readable%): the bridge counts as not running$"), 1)
+
+    -- each kind on its own, long enough for several reads
+    for kind = 1, #junk do
+        runWithBridge(mod, 3000, 0, nil, function(b)
+            writeBridge(junk[kind](b + 1000))
+        end)
+        eq((ask()), true, "kind " .. kind)
+    end
+    eq(countLogs(DETECTED), 0)
+
+    -- a real bridge whose file then turns to junk: "no beat" for three seconds, then absent
+    local beat = bridgeUp(mod, 500)
+    eq((ask()), false)
+    n = runWithBridge(mod, 2400, n, nil, writeJunk)
+    eq((ask()), false, "unusable for 2.4 s: still present")
+    runWithBridge(mod, 1700, n, nil, writeJunk)
+    eq((ask()), true, "unusable for more than three seconds")
+    eq(countLogs(GONE), 1)
+
+    -- half the reads unusable, the others showing a change: stays present
+    beat = bridgeUp(mod, beat)
+    local flip = 0
+    runWithBridge(mod, 20000, beat, nil, function(b)
+        flip = flip + 1
+        if flip % 4 < 2 then
+            writeBeat(b)
+        else
+            writeJunk(b)
+        end
+    end)
+    eq((ask()), false)
+    eq(countLogs(DETECTED), 2) eq(countLogs(GONE), 1)
+    eq(countLogs("problem:"), 0)
+    eq(countLogs("is there but"), 1, "the hint is given once")
+    checkHandles()
+    unloadMod()
+end)
+
+test("the XML handle is freed whatever happens while reading it", function()
+    local mod = loadMod()
+    mod:loadMap("map")
+    local beat = bridgeUp(mod)
+    eq((ask()), false)
+    checkHandles()
+
+    xml.getIntError = "getInt exploded"
+    local freed = xml.freed
+    beat = runWithBridge(mod, 5000, beat)
+    check(xml.freed >= freed + 4, "still loading once a second: " .. (xml.freed - freed))
+    checkHandles()
+    eq((ask()), true, "no beat for more than three seconds")
+    eq(countLogs("problem:"), 0, "a read that fails is not an error")
+
+    xml.getIntError = nil
+    runWithBridge(mod, 2600, beat)
+    eq((ask()), false, "and reading works again afterwards")
+    checkHandles()
+
+    -- the loader itself raising, or fileExists raising: "no beat", nothing left open
+    local loadIfExists = XMLFile.loadIfExists
+    XMLFile.loadIfExists = function() error("load exploded") end
+    run(mod, 4100)
+    eq((ask()), true)
+    XMLFile.loadIfExists = loadIfExists
+    beat = bridgeUp(mod, beat + 10)
+    eq((ask()), false)
+    fileExists = function() error("fileExists exploded") end
+    run(mod, 1500)
+    eq((ask()), false, "cannot tell whether the file is there: not the same as gone")
+    run(mod, 3000)
+    eq((ask()), true, "but no beat for three seconds is")
+    eq(countLogs("problem:"), 0)
+    checkHandles()
+    unloadMod()
+end)
+
+test("a file that never yields a beat is given up on after a minute, until the next savegame load", function()
+    local mod = loadMod()
+    mod:loadMap("map")
+    writeBridge(bridgeXml(77, 2))
+    run(mod, 300000, 50) -- five minutes
+    check(xml.loads >= 59 and xml.loads <= 61, "XML loads in five minutes: " .. xml.loads)
+    eq(countLogs("bridge%.xml is there but XMLFile%.loadIfExists gets no beat from it"), 1)
+    eq(countLogs("no longer checking bridge%.xml in this session"), 1)
+    eq((ask()), true)
+    checkHandles()
+    mod:deleteMap()
+
+    local loads = xml.loads
+    mod:loadMap("map") -- the next savegame load tries again
+    runWithBridge(mod, 5000, 100, 50)
+    check(xml.loads >= loads + 5, "tried again after reloading")
+    eq((ask()), false, "and finds a bridge that has been fixed in the meantime")
+    unloadMod()
+end)
+
+test("switch off: never suppressed, even with a live bridge, and bridge.xml is not even looked at", function()
     local mod, yoke = loadMod({ suppress = false })
     local original = InputBinding.getBindingForceFeedbackInfo
     mod:loadMap("map")
-    eq(InputBinding.getBindingForceFeedbackInfo, original)
-    eq((g_inputBinding:getBindingForceFeedbackInfo({})), true)
+    eq(InputBinding.getBindingForceFeedbackInfo, original, "the game's function is not even wrapped")
     eq(countLogs("game force feedback left alone %(suppressGameForceFeedback = false%)"), 1)
 
-    -- and a vehicle with active game force feedback is not touched
+    -- a vehicle with the game's force feedback active is not touched either
     local tractor = newContractScene()
     tractor.spec_drivable.forceFeedback = { isActive = true, device = yoke, axisIndex = 0, intensity = 1 }
-    drive(mod, tractor, 5)
+    g_localPlayer = { getCurrentVehicle = function() return tractor end }
+    runWithBridge(mod, 10000, 100)
+    eq((ask()), true)
     eq(tractor.spec_drivable.forceFeedback.isActive, true)
     eq(#yoke.calls, 0)
+    eq(xml.loads, 0, "XML loads") eq(xml.existsCalls, 0, "fileExists calls")
+    eq(countLogs(DETECTED), 0)
+    eq(mod.isSuppressing(), false)
     mod:deleteMap()
     eq(InputBinding.getBindingForceFeedbackInfo, original)
+    unloadMod()
+end)
+
+test("bridge.xml is read about once a second whatever the frame rate", function()
+    for _, fps in ipairs({ 20, 60, 240 }) do
+        local mod = loadMod()
+        mod:loadMap("map")
+        local tractor = newContractScene()
+        g_localPlayer = { getCurrentVehicle = function() return tractor end }
+        runWithBridge(mod, 10000, 100, 1000 / fps)
+        check(xml.loads >= 10 and xml.loads <= 11, fps .. " fps: " .. xml.loads .. " loads in 10 s")
+        eq(xml.existsCalls, xml.loads, fps .. " fps: one fileExists per load")
+        eq(xml.freed, xml.loads, fps .. " fps: every load freed")
+        checkHandles()
+        eq((ask()), false, fps .. " fps: bridge detected")
+        local lastSeq = tonumber((fileValues()).seq)
+        check(lastSeq > 10 * math.min(fps, 60) - 15, fps .. " fps: telemetry still written every frame: " .. lastSeq)
+        unloadMod()
+    end
+end)
+
+test("paused: the mod keeps following the bridge while the game keeps calling update", function()
+    local mod = loadMod()
+    mod:loadMap("map")
+    local tractor = newContractScene()
+    g_localPlayer = { getCurrentVehicle = function() return tractor end }
+    local beat = bridgeUp(mod)
+    local seq = (fileValues()).seq
+
+    g_currentMission.paused = true
+    beat = runWithBridge(mod, 10000, beat)
+    eq((ask()), false, "bridge beating through the pause: still suppressed")
+    eq((fileValues()).seq, seq, "no telemetry while paused")
+    eq(countLogs(GONE), 0)
+
+    run(mod, 4100) -- the bridge is closed while the game is paused
+    eq((ask()), true, "noticed during the pause")
+    eq(countLogs(GONE), 1)
+
+    -- and one that starts during the pause is noticed too
+    runWithBridge(mod, 2600, beat + 10)
+    eq((ask()), false)
+    eq(countLogs(DETECTED), 2)
+    g_currentMission.paused = false
+    unloadMod()
+end)
+
+test("the game stood still (update not called): old knowledge lasts for one read at most", function()
+    local function start()
+        local mod = loadMod()
+        clockSec = 5000
+        getTimeSec = function() return clockSec end
+        mod:loadMap("map")
+        local beat = bridgeUp(mod)
+        eq((ask()), false)
+        return mod, beat
+    end
+
+    -- the bridge was closed during the standstill and took its file with it
+    local mod, beat = start()
+    removeBridge()
+    clockSec = clockSec + 60
+    run(mod, 17) -- a single frame
+    eq((ask()), true, "file gone: noticed on the first frame")
+    eq(countLogs(GONE), 1)
+    unloadMod()
+
+    -- the bridge died right when the standstill began: same beat as at the last read
+    mod, beat = start()
+    run(mod, 600)
+    writeBeat(beat) -- unchanged
+    clockSec = clockSec + 60
+    run(mod, 17)
+    eq((ask()), true, "unchanged for a minute of real time: noticed on the first frame, not after three more seconds")
+    eq(countLogs(GONE), 1)
+    unloadMod()
+
+    -- the bridge wrote a few more beats, then died during the standstill
+    mod, beat = start()
+    writeBeat(beat + 7)
+    clockSec = clockSec + 60
+    run(mod, 17)
+    eq((ask()), false, "changed since the last read: it gets one more read")
+    run(mod, 1100)
+    eq((ask()), true, "and did not change again")
+    eq(countLogs(GONE), 1)
+    unloadMod()
+
+    -- the bridge ran on through the standstill: nothing happens at all
+    mod, beat = start()
+    clockSec = clockSec + 60
+    beat = runWithBridge(mod, 5000, beat + 120)
+    eq((ask()), false)
+    eq(countLogs(GONE), 0) eq(countLogs(DETECTED), 1)
+    unloadMod()
+
+    -- an ordinary long frame (a save, a stutter) is not a standstill
+    mod, beat = start()
+    for _ = 1, 20 do
+        clockSec = clockSec + 0.9 -- 0.9 s hitches the game reports as short frames
+        beat = runWithBridge(mod, 500, beat)
+    end
+    eq((ask()), false)
+    eq(countLogs(GONE), 0)
+    unloadMod()
+
+    -- without a clock only frame time counts: three seconds of frames after the standstill
+    mod = loadMod()
+    mod:loadMap("map")
+    bridgeUp(mod)
+    run(mod, 2400)
+    eq((ask()), false)
+    run(mod, 1700)
+    eq((ask()), true)
+    unloadMod()
+end)
+
+test("the game's io.open (write only) is never used on the presence file", function()
+    local mod, yoke = loadMod()
+    local calls = {}
+    io = gameLikeIo(calls)
+    mod:loadMap("map")
+    eq(countLogs("first write ok %(io%)"), 1, "telemetry is still written through the game's io.open")
+
+    local tractor = newContractScene()
+    g_localPlayer = { getCurrentVehicle = function() return tractor end }
+    run(mod, 3000)
+    eq(readFile(bridgePath), nil, "no bridge.xml appears out of nowhere")
+    local beat = bridgeUp(mod)
+    eq((ask()), false)
+    beat = runWithBridge(mod, 10000, beat)
+    eq(readFile(bridgePath), bridgeXml(beat), "bridge.xml is intact")
+    removeBridge()
+    run(mod, 1100)
+    eq((ask()), true)
+
+    check(#calls > 500, "telemetry writes went through io.open: " .. #calls)
+    for _, call in ipairs(calls) do
+        eq(call[2], "w", "io.open mode")
+        eq(call[1], telemetryPath, "io.open target")
+    end
+    eq(countLogs("problem:"), 0)
+    unloadMod()
+end)
+
+test("the presence file of the first draft (bridge.txt) is not read, created or deleted", function()
+    local mod = loadMod()
+    mod:loadMap("map")
+    local f = realIo.open(oldBridgePath, "wb")
+    f:write("MOZAFS-BRIDGE 1 beat=1 end=1\n")
+    f:close()
+    for beat = 2, 12 do
+        f = realIo.open(oldBridgePath, "wb")
+        f:write("MOZAFS-BRIDGE 1 beat=" .. beat .. " end=1\n")
+        f:close()
+        run(mod, 500)
+    end
+    eq((ask()), true, "a beating bridge.txt means nothing")
+    eq(countLogs(DETECTED), 0)
+    eq(readFile(oldBridgePath), "MOZAFS-BRIDGE 1 beat=12 end=1\n", "left as it was")
+    eq(xml.existsPaths[oldBridgePath], nil, "not even asked about")
+    eq(xml.loadPaths[oldBridgePath], nil)
+    eq(xml.existsPaths[bridgePath], true, "bridge.xml is what is asked about")
+    mod:deleteMap()
+    eq(readFile(oldBridgePath), "MOZAFS-BRIDGE 1 beat=12 end=1\n", "still there after unload")
+    unloadMod()
+end)
+
+test("without the XMLFile class the engine's own XML functions are used", function()
+    local mod = loadMod()
+    mockXmlFunctions()
+    mod:loadMap("map")
+    eq(countLogs("force feedback override installed on InputBinding class; .*bridge%.xml %(checked with loadXMLFile%)$"), 1)
+    run(mod, 3000)
+    eq(xml.loads, 0, "no file: no load")
+    local beat = bridgeUp(mod)
+    eq((ask()), false)
+    eq(countLogs(DETECTED), 1)
+    beat = runWithBridge(mod, 10000, beat)
+    checkHandles()
+    eq(xml.freed, xml.loads, "every handle deleted")
+
+    writeBridge(bridgeXml(beat + 1, 2)) -- another version: ignored
+    run(mod, 4100)
+    eq((ask()), true)
+    writeBridge("<bridge") -- load fails: handle 0
+    run(mod, 3000)
+    checkHandles()
+    bridgeUp(mod, beat + 10)
+    eq((ask()), false)
+    removeBridge()
+    run(mod, 1100)
+    eq((ask()), true, "file gone")
+    eq(countLogs(GONE), 2)
+    eq(countLogs("problem:"), 0)
+    checkHandles()
+    unloadMod()
+end)
+
+test("no way to read XML: said once at load, the game keeps its force feedback", function()
+    local mod = loadMod({ noXml = true })
+    local original = InputBinding.getBindingForceFeedbackInfo
+    mod:loadMap("map")
+    eq(countLogs("force feedback override installed on InputBinding class, but there is no way to read .*bridge%.xml here %(no fileExists%): the game keeps its steering force feedback$"), 1)
+    runWithBridge(mod, 8000, 100)
+    eq((ask()), true)
+    eq(countLogs(DETECTED), 0)
+    eq(countLogs("problem:"), 0)
+    mod:deleteMap()
+    eq(InputBinding.getBindingForceFeedbackInfo, original)
+    unloadMod()
+
+    -- fileExists but neither the class nor the functions
+    mod = loadMod()
+    XMLFile = nil
+    mod:loadMap("map")
+    eq(countLogs("but there is no way to read .*bridge%.xml here %(no XML functions%)"), 1)
+    runWithBridge(mod, 8000, 100)
+    eq((ask()), true)
+    eq(xml.existsCalls, 0, "nothing to read with, so the file is not asked about either")
+    unloadMod()
+end)
+
+test("a failure while checking for the bridge hands force feedback back to the game", function()
+    local mod = loadMod()
+    mod:loadMap("map")
+    bridgeUp(mod)
+    eq((ask()), false)
+    MozaTelemetry.presenceObserve = function() error("observe exploded") end
+    run(mod, 1100)
+    eq((ask()), true)
+    eq(countLogs(GONE), 1)
+    eq(countLogs("problem: bridge presence: .*observe exploded"), 1)
+    drive(mod, newContractScene(), 300)
+    eq((fileValues()).active, "1", "telemetry carries on")
+    eq(countLogs("problem: bridge presence"), 1)
+    checkHandles()
     unloadMod()
 end)
 
@@ -1298,15 +2142,19 @@ test("the function or the class missing is harmless and logged", function()
     local mod = loadMod({ noForceFeedbackFunction = true })
     mod:loadMap("map")
     eq(countLogs("game force feedback NOT suppressed: InputBinding.getBindingForceFeedbackInfo not found"), 1)
-    drive(mod, newContractScene(), 5)
+    g_localPlayer = { getCurrentVehicle = function() return newContractScene() end }
+    runWithBridge(mod, 5000, 100)
     eq((fileValues()).active, "1", "telemetry carries on")
+    eq(xml.loads, 0, "no override, so no reason to read bridge.xml")
+    eq(xml.existsCalls, 0)
+    eq(countLogs(DETECTED), 0)
     mod:deleteMap()
     unloadMod()
 
     mod = loadMod({ noInputBinding = true })
     mod:loadMap("map")
     eq(countLogs("game force feedback NOT suppressed"), 1)
-    drive(mod, newContractScene(), 5)
+    runWithBridge(mod, 5000, 100)
     mod:deleteMap()
     eq(countLogs("problem:"), 0)
     unloadMod()
@@ -1317,11 +2165,13 @@ test("only the instance is reachable: overridden there and cleanly removed", fun
     local class = InputBinding
     InputBinding = nil -- the class table is not visible, g_inputBinding still inherits from it
     mod:loadMap("map")
-    eq(countLogs("overridden on g_inputBinding instance"), 1)
-    eq((g_inputBinding:getBindingForceFeedbackInfo({})), false)
+    eq(countLogs("force feedback override installed on g_inputBinding instance"), 1)
+    eq((ask()), true, "passes through without the bridge")
+    bridgeUp(mod)
+    eq((ask()), false)
     mod:deleteMap()
     eq(rawget(g_inputBinding, "getBindingForceFeedbackInfo"), nil, "instance field removed")
-    eq((g_inputBinding:getBindingForceFeedbackInfo({})), true, "class method answers again")
+    eq((ask()), true, "class method answers again")
     eq(class.getBindingForceFeedbackInfo ~= nil, true)
     unloadMod()
 end)
@@ -1337,34 +2187,85 @@ test("another script wrapped the override: it is not clobbered and passes throug
         return ours(self, binding)
     end
     InputBinding.getBindingForceFeedbackInfo = wrapper
-    eq((g_inputBinding:getBindingForceFeedbackInfo({})), false)
+    local beat = bridgeUp(mod)
+    eq((ask()), false)
 
     mod:deleteMap()
     eq(InputBinding.getBindingForceFeedbackInfo, wrapper, "the other script's function is still installed")
-    local a, b, c = g_inputBinding:getBindingForceFeedbackInfo({})
+    local a, b, c = ask()
     eq(a, true, "passes through to the game after unload") eq(b, yoke) eq(c, 0)
     eq(countLogs("left in place as a pass%-through"), 1)
+
+    -- and it stays a pass-through when the next savegame loads with the bridge still running
+    mod:loadMap("map")
+    beat = bridgeUp(mod, beat)
+    eq((ask()), false, "the new wrapper suppresses")
+    mod:deleteMap()
+    eq((ask()), true, "both old wrappers pass through")
+    check(wrapperCalls > 0, "the other script's wrapper was used")
     unloadMod()
 end)
 
-test("a vehicle with the game's force feedback already active is switched off", function()
+test("the game's force feedback on the vehicle is released when the bridge arrives, and comes back by itself", function()
     local mod, yoke = loadMod()
     mod:loadMap("map")
     local tractor = newContractScene()
-    tractor.spec_drivable.forceFeedback = { isActive = true, device = yoke, binding = {}, axisIndex = 2, intensity = 1 }
-    drive(mod, tractor, 3)
+    tractor.spec_drivable.forceFeedback = { isActive = false, device = nil, binding = nil, axisIndex = 0, intensity = 1 }
+
+    -- no bridge: the game switches its force feedback on at the first steering event, as without the mod
+    drive(mod, tractor, 30)
+    gameSteeringEvent(tractor, steeringBinding, 0.3)
+    eq(tractor.spec_drivable.forceFeedback.isActive, true)
+    eq(tractor.spec_drivable.forceFeedback.device, yoke)
+    eq(#yoke.calls, 1)
+    drive(mod, tractor, 300)
+    eq(tractor.spec_drivable.forceFeedback.isActive, true, "the mod does not interfere")
+    eq(#yoke.calls, 1, "and sends the device nothing")
+
+    -- the bridge starts: what the game had going is released, the way the game does on leaving a vehicle
+    tractor.spec_drivable.forceFeedback.axisIndex = 2
+    local beat = bridgeUp(mod)
     eq(tractor.spec_drivable.forceFeedback.isActive, false)
     eq(tractor.spec_drivable.forceFeedback.device, nil)
-    eq(#yoke.calls, 1, "the device was released once")
-    eq(yoke.calls[1][1], 2, "axis") eq(yoke.calls[1][2], 0, "force") eq(yoke.calls[1][3], 0, "position")
+    eq(#yoke.calls, 2, "released once")
+    eq(yoke.calls[2][1], 2, "axis") eq(yoke.calls[2][2], 0, "force") eq(yoke.calls[2][3], 0, "position")
     eq(countLogs("had the game's steering force feedback active; switched it off"), 1)
 
-    -- a device without the method, or junk in the field, is no problem
-    tractor.spec_drivable.forceFeedback = { isActive = true, device = "junk" }
-    drive(mod, tractor, 1)
+    -- while suppressed, steering events do not switch it back on
+    for _ = 1, 20 do
+        beat = runWithBridge(mod, 500, beat)
+        gameSteeringEvent(tractor, steeringBinding, 0.3)
+    end
     eq(tractor.spec_drivable.forceFeedback.isActive, false)
-    tractor.spec_drivable.forceFeedback = "junk"
-    drive(mod, tractor, 1)
+    eq(#yoke.calls, 2, "nothing is sent to the device while suppressed")
+
+    -- the bridge stops: the mod does nothing to the vehicle or the device ...
+    removeBridge()
+    run(mod, 1100)
+    eq(countLogs(GONE), 1)
+    eq(#yoke.calls, 2)
+    eq(tractor.spec_drivable.forceFeedback.isActive, false)
+    -- ... and the game's next steering event switches its force feedback back on; no re-entry needed
+    gameSteeringEvent(tractor, steeringBinding, -0.1)
+    eq(tractor.spec_drivable.forceFeedback.isActive, true)
+    eq(tractor.spec_drivable.forceFeedback.device, yoke)
+    eq(#yoke.calls, 3)
+    eq(yoke.calls[3][3], -0.1, "the game's own call")
+
+    -- a vehicle entered while the bridge runs, with force feedback active from before: released as well
+    local other = newContractScene()
+    other.spec_drivable.forceFeedback = { isActive = true, device = yoke, binding = steeringBinding, axisIndex = 0, intensity = 1 }
+    bridgeUp(mod, beat + 10)
+    eq(tractor.spec_drivable.forceFeedback.isActive, false)
+    drive(mod, other, 2)
+    eq(other.spec_drivable.forceFeedback.isActive, false)
+
+    -- a device without the method, or junk in the field, is no problem
+    other.spec_drivable.forceFeedback = { isActive = true, device = "junk" }
+    drive(mod, other, 1)
+    eq(other.spec_drivable.forceFeedback.isActive, false)
+    other.spec_drivable.forceFeedback = "junk"
+    drive(mod, other, 1)
     eq(countLogs("problem:"), 0)
     unloadMod()
 end)

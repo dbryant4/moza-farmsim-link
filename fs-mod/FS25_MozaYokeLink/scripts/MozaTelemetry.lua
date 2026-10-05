@@ -8,6 +8,10 @@
 -- Output contract: docs/telemetry.md. One line, for example
 --   MOZAFS 1 seq=4821 t=913400 active=1 speed=5.42 steer=-0.250 mass=8200 rpm=1450 load=0.62 slip=0.04 rough=0.70 field=1 lowered=1 working=1 end=1
 --
+-- It also holds the rules for the bridge's presence file (same document,
+-- "Presence file: bridge -> mod"): deciding from a series of reads whether
+-- the bridge is running.
+--
 -- Rules followed throughout:
 --   * Syntax stays Lua 5.1 compatible (FS25 runs Luau; the tests run PUC Lua).
 --   * Every value read from the game is nil/type checked. A value that cannot
@@ -213,6 +217,120 @@ function M.throttleStep(state, dt, active)
         return true
     end
     return false
+end
+
+---------------------------------------------------------------------------
+-- bridge presence (docs/telemetry.md, "Presence file: bridge -> mod")
+---------------------------------------------------------------------------
+--
+-- The bridge replaces bridge.xml about twice a second with
+--   <bridge version="1" beat="4821"/>
+-- The mod looks at it about once a second. The bridge counts as present
+-- from the moment the beat is seen to change, until it has not changed for
+-- three seconds or the file is gone. A file left behind by a crash never
+-- changes, so it never counts.
+--
+-- These functions only do the bookkeeping; MozaYokeLink.lua does the reading.
+
+M.BRIDGE_FORMAT_VERSION = 1
+M.PRESENCE_READ_INTERVAL_MS = 1000
+M.PRESENCE_TIMEOUT_MS = 3000
+
+-- What a read can report instead of a beat:
+--   nil    nothing usable this time (unreadable, not our format)
+--   false  the file is not there
+M.FILE_GONE = false
+
+--- The beat, if the two attributes read from bridge.xml are usable; else nil.
+function M.bridgeBeat(version, beat)
+    if version ~= M.BRIDGE_FORMAT_VERSION then
+        return nil
+    end
+    if not isFinite(beat) or beat < 1 or beat ~= math.floor(beat) then
+        return nil
+    end
+    return beat
+end
+
+function M.newPresence()
+    return {
+        present = false,
+        token = nil,      -- the beat the last usable read returned
+        tokenAgeMs = 0,   -- time since that read
+        unchangedMs = 0,  -- time since the token was last seen to change
+        sinceReadMs = nil -- time since the last read; nil before the first
+    }
+end
+
+--- Advance the clocks by one frame. @return true when a read is due
+-- @param elapsedMs real time since the previous call
+-- @param force     read now (after a stretch in which no time was counted)
+function M.presenceTick(state, elapsedMs, force)
+    if not isFinite(elapsedMs) or elapsedMs < 0 then
+        elapsedMs = 0
+    end
+    state.tokenAgeMs = state.tokenAgeMs + elapsedMs
+    state.unchangedMs = state.unchangedMs + elapsedMs
+
+    if state.sinceReadMs == nil then
+        state.sinceReadMs = 0
+        return true
+    end
+    local interval = M.PRESENCE_READ_INTERVAL_MS
+    state.sinceReadMs = state.sinceReadMs + elapsedMs
+    if force == true then
+        state.sinceReadMs = 0
+        return true
+    end
+    if state.sinceReadMs + 0.01 >= interval then
+        state.sinceReadMs = state.sinceReadMs - interval
+        if state.sinceReadMs > interval or state.sinceReadMs < 0 then
+            state.sinceReadMs = 0
+        end
+        return true
+    end
+    return false
+end
+
+--- Take the result of one read. @return true while the bridge is present
+function M.presenceObserve(state, token)
+    local timeout = M.PRESENCE_TIMEOUT_MS
+
+    if token == M.FILE_GONE then
+        state.token = nil
+        state.present = false
+        return false
+    end
+    if type(token) ~= "number" and type(token) ~= "string" then
+        token = nil
+    end
+
+    if token ~= nil then
+        if state.token ~= nil and token ~= state.token then
+            if state.tokenAgeMs <= timeout + 1 then
+                -- changed since a recent read: the bridge is writing
+                state.present = true
+                state.unchangedMs = 0
+            elseif state.present then
+                -- Changed, but against a read from before a long gap (the game
+                -- stood still). That shows the bridge wrote at some point, not
+                -- that it still does: it gets one more read to change again.
+                state.unchangedMs = math.max(timeout - M.PRESENCE_READ_INTERVAL_MS, 0)
+                state.token = token
+                state.tokenAgeMs = 0
+                return true
+            end
+            -- otherwise: a change against an old read proves nothing; this
+            -- read becomes the one to compare the next against
+        end
+        state.token = token
+        state.tokenAgeMs = 0
+    end
+
+    if state.present and state.unchangedMs + 1 >= timeout then
+        state.present = false
+    end
+    return state.present
 end
 
 ---------------------------------------------------------------------------

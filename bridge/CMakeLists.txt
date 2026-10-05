@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(moza_fs_bridge VERSION 0.1.0 LANGUAGES CXX)
+project(moza_fs_bridge VERSION 0.1.1 LANGUAGES CXX)
 
 # The SDK's typed device headers (moza/device_as.hpp) use concepts.
 set(CMAKE_CXX_STANDARD 20)

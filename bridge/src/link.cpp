@@ -1,5 +1,6 @@
 #include "link.hpp"
 
+#include "presence.hpp"
 #include "settings.hpp"
 #include "status_board.hpp"
 #include "telemetry.hpp"
@@ -314,6 +315,9 @@ int runLink(moza::as::Wheelbase& base, const moza::HidDevice& hid, const LinkOpt
     std::printf("Telemetry file: %s\n", options.telemetryPath.empty() ? "(none: no default location on this system)"
                                                                        : options.telemetryPath.string().c_str());
 
+    // From here until this function returns, the mod knows the bridge is driving the yoke.
+    PresenceFile presence(options.telemetryPath);
+
     ForceModel    model(forceSettingsFrom(settings));
     std::uint64_t settingsRevision = settings.revision();
 
@@ -358,6 +362,8 @@ int runLink(moza::as::Wheelbase& base, const moza::HidDevice& hid, const LinkOpt
         {
             break;
         }
+
+        presence.tick(now);
 
         if (now >= nextModel)
         {
@@ -464,6 +470,7 @@ int runLink(moza::as::Wheelbase& base, const moza::HidDevice& hid, const LinkOpt
     }
 
     ui.stop();
+    presence.remove();
     ffb.stop();
     std::printf("Forces released. Updates that failed to send: %d.\n", sendErrors);
     return 0;

@@ -3,9 +3,13 @@
 #include "fake_moza_sdk.hpp"
 #include "ffb_session.hpp"
 #include "link.hpp"
+#include "presence.hpp"
 #include "stroke.hpp"
 
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -397,6 +401,77 @@ void testDeviceForcesSurviveHostileInput()
     CHECK(bridge::toDeviceForces(output, tuning).rumblePeriodMs == 1000);
 }
 
+std::string readWholeFile(const std::filesystem::path& path)
+{
+    std::ifstream     file(path, std::ios::binary);
+    std::stringstream text;
+    text << file.rdbuf();
+    return text.str();
+}
+
+std::string presenceXml(int beat)
+{
+    return "<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"no\"?>\n<bridge version=\"1\" beat=\"" + std::to_string(beat) + "\"/>\n";
+}
+
+void testPresenceFileBeatsWhileAliveAndIsRemovedAfterwards()
+{
+    using Clock = bridge::PresenceFile::Clock;
+    const auto folder = std::filesystem::temp_directory_path() / "moza_fs_bridge_presence_test";
+    std::filesystem::remove_all(folder);
+    std::filesystem::create_directories(folder);
+    const auto file = folder / "bridge.xml";
+
+    const Clock::time_point start = Clock::now();
+    {
+        bridge::PresenceFile presence(folder / "telemetry.txt");
+        CHECK(presence.path() == file);
+        CHECK(!std::filesystem::exists(file));
+
+        presence.tick(start);
+        CHECK(readWholeFile(file) == presenceXml(1));
+
+        // Not again until half a second has passed.
+        presence.tick(start + std::chrono::milliseconds(400));
+        CHECK(readWholeFile(file) == presenceXml(1));
+        presence.tick(start + std::chrono::milliseconds(500));
+        CHECK(readWholeFile(file) == presenceXml(2));
+        presence.tick(start + std::chrono::milliseconds(1700));
+        CHECK(readWholeFile(file) == presenceXml(3));
+    }
+    // Gone with the object, so the mod does not have to wait out its timeout.
+    CHECK(!std::filesystem::exists(file));
+    // Replaced by rename each time, with no temporary file left behind.
+    CHECK(std::filesystem::is_empty(folder));
+    std::filesystem::remove_all(folder);
+}
+
+void testPresenceFileStaysQuietWithoutTheModsFolder()
+{
+    using Clock = bridge::PresenceFile::Clock;
+    const auto folder = std::filesystem::temp_directory_path() / "moza_fs_bridge_presence_missing";
+    std::filesystem::remove_all(folder);
+
+    {
+        bridge::PresenceFile presence(folder / "telemetry.txt");
+        presence.tick(Clock::now());
+        // The mod creates this folder; the bridge must not, e.g. on a PC where the game is not installed.
+        CHECK(!std::filesystem::exists(folder));
+
+        // Once the mod has made it, the next beat lands.
+        std::filesystem::create_directories(folder);
+        presence.tick(Clock::now() + std::chrono::seconds(1));
+        CHECK(std::filesystem::exists(folder / "bridge.xml"));
+    }
+    CHECK(!std::filesystem::exists(folder / "bridge.xml"));
+    std::filesystem::remove_all(folder);
+
+    // No telemetry path at all: nothing to write next to, and nothing to remove.
+    bridge::PresenceFile nowhere{std::filesystem::path()};
+    nowhere.tick(Clock::now());
+    CHECK(nowhere.path().empty());
+}
+
 void testFormatValue()
 {
     Fixture fixture;
@@ -419,6 +494,8 @@ int main()
     testFindFlightBaseWaitsForEnumeration();
     testConditionFromPercent();
     testFormatValue();
+    testPresenceFileBeatsWhileAliveAndIsRemovedAfterwards();
+    testPresenceFileStaysQuietWithoutTheModsFolder();
     testDeviceForcesScaleAndRoute();
     testDeviceForcesAreZeroWhenForcesAreOff();
     testDeviceForcesSurviveHostileInput();

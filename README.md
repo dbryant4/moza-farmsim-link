@@ -10,7 +10,9 @@ yoke's roll axis used as steering.
 | `docs/telemetry.md` | The telemetry file format both sides are built against. |
 | `sdk/` | Where the MOZA SDK goes. **Not included in this repository**; see "Getting the MOZA SDK". |
 
-Version 0.1.0. Built for and tested on a MOZA AY210 yoke base with FS25 1.24 on Windows 11.
+Version 0.1.1. Built for and tested on a MOZA AY210 yoke base with FS25 1.24 on Windows 11.
+
+**To just use it**, download the zip from the [latest release](https://github.com/dbryant4/moza-farmsim-link/releases/latest) and follow [docs/INSTALL.md](docs/INSTALL.md).
 
 ## Status
 
@@ -44,9 +46,10 @@ forces without stopping the bridge.
 - It sends the base temporary force effects only. They vanish when it stops, and they lapse by
   themselves within two seconds if it crashes.
 - It never writes a setting to the base, and never touches MOZA Cockpit profiles or X-Plane files.
-- The mod turns off FS25's own steering force feedback while it is loaded, so the game and the
-  bridge do not fight. That is inside FS25 only. Set
-  `MozaYokeLink.suppressGameForceFeedback = false` in the mod's script to keep the game's.
+- The mod turns off FS25's own steering force feedback while the bridge is running, so the game
+  and the bridge do not fight. That is inside FS25 only, and without the bridge the mod leaves the
+  game's force feedback alone. The bridge announces itself through a small heartbeat file
+  (`docs/telemetry.md`).
 - In FS25, bind the yoke's roll axis to steering (Options > Controls). The game then maps it
   straight to steering angle with no centering of its own; centering comes from the bridge.
 
@@ -57,11 +60,9 @@ as identical files, and it can only auto-download mods that come from the ModHub
 this mod in a multiplayer save, everyone joining needs the same `FS25_MozaYokeLink.zip` in their
 mods folder (and a dedicated server needs it too). The bridge and the yoke are only needed by you.
 
-For the others the mod does nothing they would notice, with one exception: it also turns off
-FS25's own steering force feedback on their PC, so anyone with a force-feedback wheel should set
-`MozaYokeLink.suppressGameForceFeedback = false` in their copy. Then the files differ and the game
-may refuse the join, so for a group with wheels it is simpler not to enable the mod in that save.
-On a client, slip is estimated and "working" may read 0, because those are computed on the server.
+For the others the mod does nothing they would notice: it only turns off the game's steering force
+feedback on a machine where the bridge is running, so their wheels keep theirs. On a client, slip
+is estimated and "working" may read 0, because those are computed on the server.
 
 ### If something is off on the first drive
 
@@ -115,6 +116,8 @@ cmake -S bridge -B bridge/build-win -G Ninja --toolchain cmake/mingw-w64-x86_64.
 ```bash
 scp bridge/build-win/moza_fs_bridge.exe bridge/build-win/MOZA_SDK.dll "bridge/windows/Start FS25 yoke link.bat" <pc>:moza-farmsim-link/
 ```
+
+`scripts/package-release.sh` builds the release zip (exe, launcher, mod, install guide) in `dist/`.
 
 The mod is packaged by `fs-mod/package.sh` and installed by copying the zip into FS25's mods folder:
 
@@ -197,6 +200,11 @@ spring scale 34%, damper scale 20%, torque limit 100%).
 - The base lists its HID interface with 0 axes; it still reports X and Y once opened.
 
 ## Still to find out
+
+0. **Bridge detection in the game (new in 0.1.1, not yet run in FS25).** With the bridge running,
+   FS25's `log.txt` should show `[MozaYokeLink] bridge detected` within a couple of seconds, and
+   `bridge gone` after the bridge stops. If it never appears, the mod simply leaves the game's
+   force feedback alone.
 
 1. **Tuning from real driving.** Default rumble is too weak to feel: it is capped at 30%, scales
    with speed up to 29 km/h, and goes through pitch, where friction swallows anything under about

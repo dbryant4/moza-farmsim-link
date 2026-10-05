@@ -53,3 +53,45 @@ MOZAFS 1 seq=4821 t=913400 active=1 speed=5.42 steer=-0.250 mass=8200 rpm=1450 l
   in a vehicle it writes `active=0` about once a second so the file keeps moving.
 - The bridge polls at about 60 Hz. If `seq` has not changed for 500 ms the telemetry is stale: the
   game is paused, in a menu, or gone, and the bridge fades to its idle forces.
+
+# Presence file: bridge → mod
+
+The mod turns off the game's own steering force feedback only while the bridge is running on the
+same machine. Players without the bridge (for example the others in a multiplayer game) keep the
+game's force feedback. The bridge announces itself with a second file in the same folder.
+
+It is XML because that is what the game's Lua can read back: its `io.open` only writes.
+
+## Location
+
+```
+<FS25 user profile>/modSettings/FS25_MozaYokeLink/bridge.xml
+```
+
+It sits next to `telemetry.txt`; the bridge derives its path from the telemetry file's folder.
+
+## Format
+
+Rewritten in full about twice a second while the bridge is linked:
+
+```xml
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<bridge version="1" beat="4821"/>
+```
+
+- `version` is the format version, 1. A reader ignores a file with any other value.
+- `beat` is a positive integer that goes up by one on every write.
+
+## Rules
+
+- **Bridge:** writes only while it is running its game link, and only if the folder already
+  exists (the mod creates it). It replaces the file atomically (a temporary file in the same
+  folder, renamed over `bridge.xml`), so a reader never sees half a file; if the rename is refused
+  because the game has the file open at that instant, that beat is skipped. It deletes the file
+  when it stops cleanly.
+- **Mod:** reads the file about once a second. The bridge counts as present from the moment
+  `beat` is seen to change, and stops counting as present when `beat` has not changed for
+  3 seconds of real time or the file is gone. A file left behind by a crash therefore never counts.
+- While the bridge is present, and the mod's `suppressGameForceFeedback` switch is on, the game's
+  steering force feedback is suppressed. At all other times the mod leaves it exactly as the game
+  has it.
