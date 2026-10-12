@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(moza_fs_bridge VERSION 0.1.1 LANGUAGES CXX)
+project(moza_fs_bridge VERSION 0.1.2 LANGUAGES CXX)
 
 # The SDK's typed device headers (moza/device_as.hpp) use concepts.
 set(CMAKE_CXX_STANDARD 20)
@@ -18,7 +18,8 @@ else()
 endif()
 option(BRIDGE_FAKE_SDK "Link the in-process fake MOZA SDK instead of MOZA_SDK.dll" ${_fake_sdk_default})
 
-add_library(bridge_core STATIC src/ffb_session.cpp src/force_model.cpp src/link.cpp src/telemetry.cpp)
+add_library(bridge_core STATIC src/ffb_session.cpp src/force_model.cpp src/link.cpp src/mod_sync.cpp src/telemetry.cpp src/update_check.cpp
+            src/yoke_lights.cpp)
 target_include_directories(bridge_core PUBLIC src)
 # The settings registry, live status and the local web page that edits them. No SDK involved:
 # a thread for the HTTP server and the system's sockets are all they need.
@@ -26,7 +27,7 @@ target_sources(bridge_core PRIVATE src/settings.cpp src/status_board.cpp src/web
 find_package(Threads REQUIRED)
 target_link_libraries(bridge_core PUBLIC Threads::Threads)
 if(WIN32)
-    target_link_libraries(bridge_core PUBLIC ws2_32)
+    target_link_libraries(bridge_core PUBLIC ws2_32 shell32 ole32)
 endif()
 if(MSVC)
     target_compile_options(bridge_core PUBLIC /W4 /utf-8)
@@ -70,6 +71,23 @@ if(MINGW)
     target_link_options(moza_fs_bridge PRIVATE -static $<$<CONFIG:Release>:-s>)
 endif()
 
+# The everyday program on Windows: the same code built without a console, living behind an icon by
+# the clock. moza_fs_bridge stays a console program for the test options.
+if(WIN32)
+    enable_language(RC)
+    target_sources(moza_fs_bridge PRIVATE src/updater_win.cpp windows/app.rc)
+    target_link_libraries(moza_fs_bridge PRIVATE winhttp bcrypt shell32)
+    add_executable(moza_fs_link WIN32 src/main.cpp src/tray_win.cpp src/updater_win.cpp windows/app.rc)
+    target_compile_definitions(moza_fs_link PRIVATE BRIDGE_TRAY BRIDGE_VERSION="${PROJECT_VERSION}")
+    target_link_libraries(moza_fs_link PRIVATE bridge_core shell32 winhttp bcrypt)
+    if(MINGW)
+        target_link_options(moza_fs_link PRIVATE -static $<$<CONFIG:Release>:-s>)
+    elseif(MSVC)
+        # WIN32 makes MSVC look for WinMain; this program has an ordinary main.
+        target_link_options(moza_fs_link PRIVATE /ENTRY:mainCRTStartup)
+    endif()
+endif()
+
 if(NOT BRIDGE_FAKE_SDK)
     add_custom_command(TARGET moza_fs_bridge POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:MOZA_SDK::MOZA_SDK> $<TARGET_FILE_DIR:moza_fs_bridge>
@@ -99,6 +117,10 @@ if(BRIDGE_FAKE_SDK)
     add_executable(test_web_ui tests/test_web_ui.cpp)
     target_link_libraries(test_web_ui PRIVATE bridge_core)
     add_test(NAME web_ui COMMAND test_web_ui)
+    # Reading GitHub's release document, version comparison, and keeping the game's mod current.
+    add_executable(test_update tests/test_update.cpp)
+    target_link_libraries(test_update PRIVATE bridge_core)
+    add_test(NAME update COMMAND test_update)
     # Not a test: serves the tuning page with simulated values, for looking at it in a browser.
     add_executable(web_ui_demo tests/web_ui_demo.cpp)
     target_link_libraries(web_ui_demo PRIVATE bridge_core)

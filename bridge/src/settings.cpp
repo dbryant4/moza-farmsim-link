@@ -302,6 +302,58 @@ std::vector<SettingState> Settings::snapshot() const
     return result;
 }
 
+void Settings::readLines(const std::vector<std::string_view>& lines, std::vector<double>& values, std::vector<bool>& given,
+                         std::vector<std::string>& warnings) const
+{
+    for (std::size_t i = 0; i < lines.size(); ++i)
+    {
+        std::string_view line = lines[i];
+        if (i == 0 && line.substr(0, 3) == "\xEF\xBB\xBF")
+        {
+            // Notepad's UTF-8 byte order mark.
+            line.remove_prefix(3);
+        }
+        line = trim(line);
+        if (line.empty() || line.front() == '#' || line.front() == ';')
+        {
+            continue;
+        }
+        const std::string where  = "line " + std::to_string(i + 1) + ": ";
+        const auto        equals = line.find('=');
+        if (equals == std::string_view::npos)
+        {
+            warnings.push_back(where + "expected 'key = value', skipped");
+            continue;
+        }
+        const std::string_view key  = trim(line.substr(0, equals));
+        std::string_view       text = line.substr(equals + 1);
+        text                        = trim(text.substr(0, text.find('#')));
+
+        const auto found = m_index.find(key);
+        if (found == m_index.end())
+        {
+            warnings.push_back(where + "unknown setting '" + std::string(key) + "', skipped");
+            continue;
+        }
+        const SettingInfo& info = m_entries[found->second].info;
+
+        const std::optional<double> value = parseValue(info.kind, text);
+        if (!value)
+        {
+            warnings.push_back(where + "cannot read '" + std::string(text) + "' as a value for " + info.key + ", skipped");
+            continue;
+        }
+        const double kept = clamped(info, *value);
+        if (kept != *value)
+        {
+            warnings.push_back(where + info.key + " = " + formatNumber(*value) + " is outside " + formatNumber(info.minimum) +
+                                      " to " + formatNumber(info.maximum) + ", using " + formatNumber(kept));
+        }
+        values[found->second] = kept;
+        given[found->second]  = true;
+    }
+}
+
 Settings::LoadResult Settings::load(const std::filesystem::path& path)
 {
     std::lock_guard fileLock(m_fileMutex);
@@ -354,52 +406,8 @@ Settings::LoadResult Settings::load(const std::filesystem::path& path)
         values.push_back(entry.info.defaultValue);
     }
 
-    for (std::size_t i = 0; i < lines.size(); ++i)
-    {
-        std::string_view line = lines[i];
-        if (i == 0 && line.substr(0, 3) == "\xEF\xBB\xBF")
-        {
-            // Notepad's UTF-8 byte order mark.
-            line.remove_prefix(3);
-        }
-        line = trim(line);
-        if (line.empty() || line.front() == '#' || line.front() == ';')
-        {
-            continue;
-        }
-        const std::string where  = "line " + std::to_string(i + 1) + ": ";
-        const auto        equals = line.find('=');
-        if (equals == std::string_view::npos)
-        {
-            result.warnings.push_back(where + "expected 'key = value', skipped");
-            continue;
-        }
-        const std::string_view key  = trim(line.substr(0, equals));
-        std::string_view       text = line.substr(equals + 1);
-        text                        = trim(text.substr(0, text.find('#')));
-
-        const auto found = m_index.find(key);
-        if (found == m_index.end())
-        {
-            result.warnings.push_back(where + "unknown setting '" + std::string(key) + "', skipped");
-            continue;
-        }
-        const SettingInfo& info = m_entries[found->second].info;
-
-        const std::optional<double> value = parseValue(info.kind, text);
-        if (!value)
-        {
-            result.warnings.push_back(where + "cannot read '" + std::string(text) + "' as a value for " + info.key + ", skipped");
-            continue;
-        }
-        const double kept = clamped(info, *value);
-        if (kept != *value)
-        {
-            result.warnings.push_back(where + info.key + " = " + formatNumber(*value) + " is outside " + formatNumber(info.minimum) +
-                                      " to " + formatNumber(info.maximum) + ", using " + formatNumber(kept));
-        }
-        values[found->second] = kept;
-    }
+    std::vector<bool> given(m_entries.size(), false);
+    readLines(std::vector<std::string_view>(lines.begin(), lines.end()), values, given, result.warnings);
 
     bool changed = false;
     for (std::size_t i = 0; i < m_entries.size(); ++i)
@@ -415,20 +423,13 @@ Settings::LoadResult Settings::load(const std::filesystem::path& path)
     return result;
 }
 
-bool Settings::save(const std::filesystem::path& path, std::string* error)
+std::string Settings::exportText() const
 {
-    std::lock_guard fileLock(m_fileMutex);
+    return settingsText(snapshot());
+}
 
-    const auto fail = [&](const std::string& reason) {
-        if (error)
-        {
-            *error = reason;
-        }
-        return false;
-    };
-
-    const std::vector<SettingState> states = snapshot();
-
+std::string Settings::settingsText(const std::vector<SettingState>& states)
+{
     std::string text = "# moza_fs_bridge settings. Loaded when the bridge starts and rewritten by Save in the web UI.\n"
                        "# Safe to edit by hand while the bridge is not running: one 'key = value' per line,\n"
                        "# lines starting with # are comments, and anything missing or unreadable falls back to its default.\n";
@@ -461,6 +462,65 @@ bool Settings::save(const std::filesystem::path& path, std::string* error)
         }
         text += info.key + " = " + valueText(info, state.value) + "\n";
     }
+    return text;
+}
+
+Settings::ImportResult Settings::importText(std::string_view text)
+{
+    std::vector<std::string_view> lines;
+    while (!text.empty())
+    {
+        const auto end = text.find('\n');
+        lines.push_back(text.substr(0, end));
+        text.remove_prefix(end == std::string_view::npos ? text.size() : end + 1);
+    }
+
+    std::lock_guard     lock(m_mutex);
+    std::vector<double> values;
+    values.reserve(m_entries.size());
+    for (const Entry& entry : m_entries)
+    {
+        values.push_back(entry.value);
+    }
+    std::vector<bool> given(m_entries.size(), false);
+    ImportResult      result;
+    readLines(lines, values, given, result.warnings);
+
+    for (std::size_t i = 0; i < m_entries.size(); ++i)
+    {
+        if (!given[i])
+        {
+            continue;
+        }
+        ++result.applied;
+        if (m_entries[i].value != values[i])
+        {
+            ++result.changed;
+            m_entries[i].value = values[i];
+        }
+    }
+    if (result.changed > 0)
+    {
+        m_revision.fetch_add(1, std::memory_order_release);
+    }
+    return result;
+}
+
+bool Settings::save(const std::filesystem::path& path, std::string* error)
+{
+    std::lock_guard fileLock(m_fileMutex);
+
+    const auto fail = [&](const std::string& reason) {
+        if (error)
+        {
+            *error = reason;
+        }
+        return false;
+    };
+
+    // The values written are the ones marked as saved below, whatever changes in between.
+    const std::vector<SettingState> states = snapshot();
+    const std::string               text   = settingsText(states);
 
     std::filesystem::path temporary = path;
     temporary += ".tmp";

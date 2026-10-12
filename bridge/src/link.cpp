@@ -1,10 +1,12 @@
 #include "link.hpp"
 
+#include "pitch_servo.hpp"
 #include "presence.hpp"
 #include "settings.hpp"
 #include "status_board.hpp"
 #include "telemetry.hpp"
 #include "web_ui.hpp"
+#include "yoke_lights.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -64,16 +66,57 @@ const Tunable kTunables[] = {
      60, 1, &ForceSettings::rumbleFullSpeed, kKmhPerMs},
     {"rumble.working", "Rumble", "Extra while working", "How much stronger the rumble gets while an implement works the ground.", "%", 0, 200,
      5, &ForceSettings::rumbleWorkingBoost, 100},
-    {"rumble.engine", "Rumble", "Engine vibration", "Vibration from the running engine, including at a standstill.", "%", 0, 100, 1,
+    {"rumble.engine", "Rumble", "Engine vibration",
+     "Vibration from a running combustion engine, including at a standstill. Electric vehicles have none.", "%", 0, 100, 1,
      &ForceSettings::engineRumble, 100},
-    {"rumble.limit", "Rumble", "Rumble limit", "Cap on all vibration combined.", "%", 0, 100, 1, &ForceSettings::rumbleMax, 100},
+    {"rumble.engine_start", "Rumble", "Engine start shake",
+     "Extra shake while a combustion engine is being started, fading once it runs. Electric vehicles have none.", "%", 0, 100, 1,
+     &ForceSettings::engineStartShake, 100},
+    {"rumble.limit", "Rumble", "Rumble limit", "Cap on surface and engine vibration combined; the start shake comes on top.", "%", 0, 100,
+     1, &ForceSettings::rumbleMax, 100},
     {"rumble.slow_hz", "Rumble", "Frequency when slow", "Vibration frequency at walking pace.", "Hz", 2, 60, 1, &ForceSettings::rumbleMinHz, 1},
     {"rumble.fast_hz", "Rumble", "Frequency when fast", "Vibration frequency at road speed.", "Hz", 2, 60, 1, &ForceSettings::rumbleMaxHz, 1},
+
+    {"surfaces.road", "Surfaces", "Asphalt and concrete",
+     "Paved ground is smooth, so this starts at nothing. Raising it gives a faint, fast buzz at speed.", "%", 0, 200, 5,
+     &ForceSettings::surfaceRoad, 100},
+    {"surfaces.gravel", "Surfaces", "Gravel and dirt tracks", "A fast, gritty buzz that rises with speed.", "%", 0, 200, 5,
+     &ForceSettings::surfaceGravel, 100},
+    {"surfaces.grass", "Surfaces", "Grass", "Low and soft, in long swells.", "%", 0, 200, 5, &ForceSettings::surfaceGrass, 100},
+    {"surfaces.snow", "Surfaces", "Snow", "Lower and more muffled than grass.", "%", 0, 200, 5, &ForceSettings::surfaceSnow, 100},
+    {"surfaces.field", "Surfaces", "Fields: sown, rolled or stubble", "A medium, steady rumble.", "%", 0, 200, 5,
+     &ForceSettings::surfaceField, 100},
+    {"surfaces.tilled", "Surfaces", "Fields: ploughed or cultivated", "Slow and heavy, coming and going clod by clod.", "%", 0, 200, 5,
+     &ForceSettings::surfaceTilled, 100},
+    {"surfaces.ridge", "Surfaces", "Fields: ridges", "A pulse for each ridge crossed, faster as you speed up.", "%", 0, 200, 5,
+     &ForceSettings::surfaceRidge, 100},
+    {"surfaces.heap", "Surfaces", "Heaps of tipped material", "A slow lurching while driving over a heap.", "%", 0, 200, 5,
+     &ForceSettings::surfaceHeap, 100},
+    {"surfaces.tug", "Surfaces", "Tug on broken ground",
+     "Small irregular pulls on the wheel on ploughed, cultivated and ridged fields. Heavier machines get less. 0 turns it off.", "%", 0,
+     50, 1, &ForceSettings::fieldTug, 100},
+
+    {"bumps.kick", "Bumps", "Obstacle kick",
+     "Jerk of the wheel toward the side whose front wheel hits something like a log or a kerb. Heavier machines get less.", "%", 0, 100,
+     1, &ForceSettings::bumpKick, 100},
+    {"bumps.thump", "Bumps", "Thump (in and out)",
+     "In-and-out shake when both front wheels are jolted together, as on rail tracks.", "%", 0, 100, 1, &ForceSettings::bumpThump, 100},
+    {"bumps.wiggle", "Bumps", "Wiggle (left and right)",
+     "Left-right shake of the wheel for the same kind of bump. Heavier machines get less.", "%", 0, 100, 1, &ForceSettings::bumpWiggle,
+     100},
+    {"bumps.shake_hz", "Bumps", "Shake frequency", "How fast the thump and the wiggle go back and forth.", "Hz", 2, 30, 0.5,
+     &ForceSettings::bumpShakeHz, 1},
+    {"bumps.mass_half", "Bumps", "Mass that halves kick and wiggle",
+     "Total mass, with implements, at which the kick and the wiggle are down to half. Lower makes big machines calmer.", "t", 1, 50, 0.5,
+     &ForceSettings::bumpKickMassHalf, 0.001},
 
     {"pitch.hold", "Pitch (in/out)", "Hold stiffness", "How firmly the yoke is held at its center in and out while driving.", "%", 0, 100, 1,
      &ForceSettings::pitchSpring, 100},
     {"pitch.damping", "Pitch (in/out)", "Damping", "Resistance to pushing and pulling the yoke while driving.", "%", 0, 100, 1,
      &ForceSettings::pitchDamper, 100},
+    {"pitch.accel_sway", "Pitch (in/out)", "Acceleration sway",
+     "How far the yoke leans out and in while pulling away and braking, as a share of its travel from center. 0 turns it off.", "%", 0,
+     50, 1, &ForceSettings::accelSway, 100},
 
     {"idle.centering", "Out of the vehicle", "Centering", "Centering on both axes while on foot, in a menu, or with the game closed.", "%", 0,
      100, 1, &ForceSettings::idleSpring, 100},
@@ -84,6 +127,15 @@ const Tunable kTunables[] = {
 constexpr const char* kStrengthKey     = "general.strength";
 constexpr const char* kFlipPullKey     = "general.flip_pull";
 constexpr const char* kRumbleOnRollKey = "rumble.on_steering";
+constexpr const char* kFlipSwayKey     = "pitch.sway_reverse";
+constexpr const char* kLightsKey       = "lights.follow_engine";
+constexpr const char* kLightsLowKey    = "lights.low";
+constexpr const char* kLightsRpmKey    = "lights.full_rpm";
+constexpr const char* kLightsColorKey  = "lights.color_shift";
+constexpr const char* kLightsFromKey   = "lights.color_from";
+constexpr const char* kSwayKey         = "pitch.accel_sway";
+constexpr const char* kUpdatesKey      = "updates.check";
+constexpr const char* kPatternsKey     = "surfaces.patterns";
 
 void registerSettings(Settings& settings)
 {
@@ -94,12 +146,40 @@ void registerSettings(Settings& settings)
     const ForceSettings defaults;
     for (const Tunable& tunable : kTunables)
     {
+        // The switch for the surface patterns heads their group, wherever the table puts it.
+        if (std::string_view(tunable.group) == "Surfaces" && !settings.contains(kPatternsKey))
+        {
+            settings.addToggle(kPatternsKey, "Surfaces", "A different feel for each surface",
+                               "Off gives every surface the same plain rumble, stronger or weaker with how rough it is. The "
+                               "strengths below multiply what Surface rumble gives.",
+                               defaults.surfacePatterns);
+        }
         settings.addNumber(tunable.key, tunable.group, tunable.label, tunable.description, tunable.unit, tunable.minimum, tunable.maximum,
                            tunable.step, defaults.*tunable.field * tunable.scale);
     }
 
+    settings.addToggle(kFlipSwayKey, "Pitch (in/out)", "Reverse acceleration sway",
+                       "Turn on if the yoke leans the wrong way when you pull away.", false);
+    settings.addToggle(kLightsKey, "Yoke lights", "Lights follow the engine",
+                       "Off with the engine off, dim at idle, brighter with engine speed. Changes the handle's stored brightness "
+                       "while the bridge runs and puts it back when it stops.",
+                       false);
+    settings.addNumber(kLightsLowKey, "Yoke lights", "Brightness at idle", "How bright the lights are with the engine idling.", "of 15", 1,
+                       15, 1, LightTuning{}.low);
+    settings.addToggle(kLightsColorKey, "Yoke lights", "Colour shifts at high revs",
+                       "Near the top of the engine's range the lights move from your colour through amber to red.", true);
+    settings.addNumber(kLightsFromKey, "Yoke lights", "Colour starts to shift at",
+                       "How far through the engine's range, from idle to flat out, the colour begins to change.", "%", 0, 95, 5,
+                       LightTuning{}.colorFrom * 100.0);
+    settings.addNumber(kLightsRpmKey, "Yoke lights", "Full engine speed, if the game does not say",
+                       "Each machine's own maximum engine speed is used when the game reports it; this is the fallback.", "rpm", 1000,
+                       4000, 50, LightTuning{}.fullRpm);
     settings.addToggle(kRumbleOnRollKey, "Rumble", "Rumble through the steering axis",
                        "Off sends rumble through in/out instead, which you feel in the grips without it steering the vehicle.", false);
+    settings.addToggle(kUpdatesKey, "Updates", "Look for new versions",
+                       "Once a day the program by the clock asks GitHub whether a newer release exists and tells you. Nothing is "
+                       "downloaded or installed until you pick it from the icon's menu.",
+                       true);
 }
 
 ForceSettings forceSettingsFrom(const Settings& settings)
@@ -109,6 +189,7 @@ ForceSettings forceSettingsFrom(const Settings& settings)
     {
         result.*tunable.field = settings.get(tunable.key) / tunable.scale;
     }
+    result.surfacePatterns = settings.enabled(kPatternsKey);
     return result;
 }
 
@@ -118,7 +199,19 @@ LinkTuning tuningFrom(const Settings& settings, const StatusBoard& status, int f
     tuning.strength     = status.forcesEnabled() ? settings.get(kStrengthKey) / 100.0 : 0.0;
     tuning.flipPull     = settings.enabled(kFlipPullKey);
     tuning.rumbleOnRoll = settings.enabled(kRumbleOnRollKey);
+    tuning.flipSway     = settings.enabled(kFlipSwayKey);
     tuning.fullScale    = fullScale;
+    return tuning;
+}
+
+LightTuning lightTuningFrom(const Settings& settings)
+{
+    LightTuning tuning;
+    tuning.followEngine = settings.enabled(kLightsKey);
+    tuning.low          = settings.get(kLightsLowKey);
+    tuning.fullRpm      = settings.get(kLightsRpmKey);
+    tuning.colorShift   = settings.enabled(kLightsColorKey);
+    tuning.colorFrom    = settings.get(kLightsFromKey) / 100.0;
     return tuning;
 }
 
@@ -128,9 +221,12 @@ void registerStatus(StatusBoard& status)
     status.addRanged("game.speed", "Game", "Speed", "km/h", -30, 60, 1);
     status.addRanged("game.steer", "Game", "Steering", "", -1, 1, 2);
     status.add("game.mass", "Game", "Total mass", "t", 1);
+    status.add("game.surface", "Game", "Surface");
     status.addRanged("game.rough", "Game", "Surface roughness", "", 0, 1, 2);
     status.addRanged("game.slip", "Game", "Wheel slip", "", 0, 1, 2);
+    status.addRanged("game.bump", "Game", "Wheel bump (left - / right +)", "", -1, 1, 2);
     status.add("game.implement", "Game", "Implement");
+    status.add("game.engine", "Game", "Engine");
 
     status.addRanged("yoke.roll", "Yoke", "Roll position", "", -1, 1, 3);
     status.addRanged("yoke.pitch", "Yoke", "Pitch position", "", -1, 1, 3);
@@ -143,6 +239,10 @@ void registerStatus(StatusBoard& status)
     status.addRanged("force.rumble", "Forces", "Rumble", "%", 0, 100, 0);
     status.add("force.rumble_hz", "Forces", "Rumble frequency", "Hz", 0);
     status.addRanged("force.pitch_hold", "Forces", "Pitch hold", "%", 0, 100, 0);
+    status.addRanged("game.accel", "Game", "Acceleration", "m/s\xC2\xB2", -5, 5, 2);
+    status.addRanged("force.sway", "Forces", "Pitch sway target", "", -0.5, 0.5, 3);
+    status.addRanged("force.pitch_push", "Forces", "Pitch push", "%", -100, 100, 0);
+    status.add("yoke.lights", "Yoke", "Lights");
     status.add("bridge.send_errors", "Bridge", "Commands that failed to send", "", 0);
 }
 
@@ -171,6 +271,22 @@ double cachedTorque(const moza::RawParameter& parameter)
     return value.isFloat() ? value.asDouble() : value.asInt() / 10000.0;
 }
 
+const char* surfaceLabel(Surface surface)
+{
+    switch (surface)
+    {
+    case Surface::Road: return "asphalt or concrete";
+    case Surface::Gravel: return "gravel or dirt track";
+    case Surface::Grass: return "grass";
+    case Surface::Snow: return "snow";
+    case Surface::Heap: return "heap";
+    case Surface::Field: return "field";
+    case Surface::Tilled: return "field, ploughed or cultivated";
+    case Surface::Ridge: return "field, ridges";
+    default: return "not reported";
+    }
+}
+
 const char* telemetryText(const TelemetryView& view)
 {
     switch (view.state)
@@ -188,12 +304,17 @@ struct Effects
     std::uint8_t damper = 0;
     std::uint8_t pull   = 0;
     std::uint8_t rumble = 0;
+    std::uint8_t thump  = 0;
+    std::uint8_t wiggle = 0;
+    std::uint8_t push   = 0;
 
     bool registerAll(FfbSession& ffb)
     {
         // begin() frees everything on the base first, so this also recovers effects another program wiped.
         return ffb.begin() && (spring = ffb.addEffect(EffectType::Spring)) != 0 && (damper = ffb.addEffect(EffectType::Damper)) != 0 &&
-               (pull = ffb.addEffect(EffectType::ConstantForce)) != 0 && (rumble = ffb.addEffect(EffectType::Sine)) != 0;
+               (pull = ffb.addEffect(EffectType::ConstantForce)) != 0 && (rumble = ffb.addEffect(EffectType::Sine)) != 0 &&
+               (thump = ffb.addEffect(EffectType::Sine)) != 0 && (wiggle = ffb.addEffect(EffectType::Sine)) != 0 &&
+               (push = ffb.addEffect(EffectType::ConstantForce)) != 0;
     }
 };
 
@@ -215,10 +336,13 @@ bool send(FfbSession& ffb, const Effects& effects, const DeviceForces& now, Devi
         ok &= ffb.setCondition(effects.spring, Axis::Roll, condition(now.rollSpring, fullScale));
         sent.rollSpring = now.rollSpring;
     }
-    if (differs(now.pitchSpring, sent.pitchSpring))
+    if (differs(now.pitchSpring, sent.pitchSpring) || differs(now.pitchCenter, sent.pitchCenter))
     {
-        ok &= ffb.setCondition(effects.spring, Axis::Pitch, condition(now.pitchSpring, fullScale));
+        Condition pitch = condition(now.pitchSpring, fullScale);
+        pitch.center    = now.pitchCenter;
+        ok &= ffb.setCondition(effects.spring, Axis::Pitch, pitch);
         sent.pitchSpring = now.pitchSpring;
+        sent.pitchCenter = now.pitchCenter;
     }
     if (differs(now.rollDamper, sent.rollDamper))
     {
@@ -235,6 +359,11 @@ bool send(FfbSession& ffb, const Effects& effects, const DeviceForces& now, Devi
         ok &= ffb.setConstant(effects.pull, now.pull, forceAlong(Axis::Roll));
         sent.pull = now.pull;
     }
+    if (differs(now.pitchPush, sent.pitchPush))
+    {
+        ok &= ffb.setConstant(effects.push, now.pitchPush, forceAlong(Axis::Pitch));
+        sent.pitchPush = now.pitchPush;
+    }
     if (restartRumble || differs(now.rumble, sent.rumble) || now.rumblePeriodMs != sent.rumblePeriodMs || now.rumbleAxis != sent.rumbleAxis)
     {
         ok &= ffb.setPeriodic(effects.rumble, now.rumble, now.rumblePeriodMs, forceAlong(now.rumbleAxis), kRumbleDurationMs);
@@ -243,22 +372,82 @@ bool send(FfbSession& ffb, const Effects& effects, const DeviceForces& now, Devi
         sent.rumbleAxis     = now.rumbleAxis;
     }
 
+    // The two bump shakes are separate sines so that they keep their own slow frequency whatever
+    // the rumble is doing. They sit at zero almost all the time.
+    const bool bumpPeriodChanged = now.bumpPeriodMs != sent.bumpPeriodMs;
+    if (restartRumble || bumpPeriodChanged || differs(now.thump, sent.thump))
+    {
+        ok &= ffb.setPeriodic(effects.thump, now.thump, now.bumpPeriodMs, forceAlong(Axis::Pitch), kRumbleDurationMs);
+        sent.thump = now.thump;
+    }
+    if (restartRumble || bumpPeriodChanged || differs(now.wiggle, sent.wiggle))
+    {
+        ok &= ffb.setPeriodic(effects.wiggle, now.wiggle, now.bumpPeriodMs, forceAlong(Axis::Roll), kRumbleDurationMs);
+        sent.wiggle = now.wiggle;
+    }
+    sent.bumpPeriodMs = now.bumpPeriodMs;
+
     if (everything)
     {
         ok &= ffb.start(effects.spring);
         ok &= ffb.start(effects.damper);
         ok &= ffb.start(effects.pull);
+        ok &= ffb.start(effects.push);
     }
     if (restartRumble)
     {
         ok &= ffb.start(effects.rumble);
+        ok &= ffb.start(effects.thump);
+        ok &= ffb.start(effects.wiggle);
     }
     return ok;
 }
 
 } // namespace
 
-DeviceForces toDeviceForces(const ForceOutput& output, const LinkTuning& tuning)
+LightTarget lightTargetFor(const Telemetry* telemetry, const LightTuning& tuning)
+{
+    LightTarget target;
+    if (!tuning.followEngine || telemetry == nullptr || !telemetry->active)
+    {
+        return target;
+    }
+    const double brightest = YokeLights::kBrightest;
+    const double low       = std::clamp(std::isfinite(tuning.low) ? tuning.low : 0.0, 0.0, brightest);
+    if (telemetry->starting)
+    {
+        target.level = low;
+        return target;
+    }
+    if (!(telemetry->rpm > 0.0))
+    {
+        target.level = 0.0;
+        return target;
+    }
+
+    // Each machine's own range when the game reports it: a small loader and a big tractor both
+    // reach full brightness flat out, though one does it at 3000 rpm and the other at 1900.
+    const bool   known = telemetry->rpmMax > telemetry->rpmMin && telemetry->rpmMin >= 0.0 && std::isfinite(telemetry->rpmMax);
+    const double idle  = known ? telemetry->rpmMin : tuning.idleRpm;
+    const double full  = known ? telemetry->rpmMax : tuning.fullRpm;
+    const double share = full > idle ? std::clamp((telemetry->rpm - idle) / (full - idle), 0.0, 1.0) : 1.0;
+
+    target.level = low + (brightest - low) * share;
+    if (tuning.colorShift)
+    {
+        const double from = std::clamp(std::isfinite(tuning.colorFrom) ? tuning.colorFrom : 0.0, 0.0, 0.99);
+        target.heat       = std::clamp((share - from) / (1.0 - from), 0.0, 1.0);
+    }
+    return target;
+}
+
+double pitchTargetFor(const ForceOutput& output, const LinkTuning& tuning)
+{
+    const double target = std::isfinite(output.pitchTarget) ? std::clamp(output.pitchTarget, -1.0, 1.0) : 0.0;
+    return tuning.flipSway ? -target : target;
+}
+
+DeviceForces toDeviceForces(const ForceOutput& output, const LinkTuning& tuning, double pitchPush)
 {
     const double strength = std::clamp(std::isfinite(tuning.strength) ? tuning.strength : 0.0, 0.0, 1.0);
 
@@ -270,14 +459,28 @@ DeviceForces toDeviceForces(const ForceOutput& output, const LinkTuning& tuning)
 
     // The model's positive is "toward steering right"; on the AY210 a positive magnitude moves the
     // reported roll position down, i.e. left. Hence the minus, unless the user flips it.
-    const double pull = std::clamp(output.rollForce, -1.0, 1.0) * strength * (tuning.flipPull ? 1.0 : -1.0);
+    const double kick = std::isfinite(output.rollKick) ? output.rollKick : 0.0;
+    const double pull = std::clamp(output.rollForce + kick, -1.0, 1.0) * strength * (tuning.flipPull ? 1.0 : -1.0);
     forces.pull       = toRaw(pull, tuning.fullScale);
 
-    forces.rumble     = toRaw(std::clamp(output.rumble, 0.0, 1.0) * strength, tuning.fullScale);
+    const double texture = std::isfinite(output.rumbleTexture) ? std::clamp(output.rumbleTexture, 0.0, 1.0) : 1.0;
+    forces.rumble        = toRaw(std::clamp(output.rumble, 0.0, 1.0) * texture * strength, tuning.fullScale);
     forces.rumbleAxis = tuning.rumbleOnRoll ? Axis::Roll : Axis::Pitch;
     if (std::isfinite(output.rumbleHz) && output.rumbleHz >= 1.0)
     {
         forces.rumblePeriodMs = static_cast<std::uint32_t>(std::clamp(std::lround(1000.0 / output.rumbleHz), 5L, 1000L));
+    }
+
+    // A spring center is a position, so it is not scaled by strength; measured on the AY210, a positive
+    // center sits at a higher reported position while a positive constant force pushes toward a lower one.
+    forces.pitchCenter = toRaw(pitchTargetFor(output, tuning), tuning.fullScale);
+    forces.pitchPush   = toRaw(-(std::isfinite(pitchPush) ? std::clamp(pitchPush, -1.0, 1.0) : 0.0) * strength, tuning.fullScale);
+
+    forces.thump  = toRaw(std::clamp(output.pitchThump, 0.0, 1.0) * strength, tuning.fullScale);
+    forces.wiggle = toRaw(std::clamp(output.rollWiggle, 0.0, 1.0) * strength, tuning.fullScale);
+    if (std::isfinite(output.bumpHz) && output.bumpHz >= 1.0)
+    {
+        forces.bumpPeriodMs = static_cast<std::uint32_t>(std::clamp(std::lround(1000.0 / output.bumpHz), 5L, 1000L));
     }
     return forces;
 }
@@ -296,6 +499,15 @@ int runLink(moza::as::Wheelbase& base, const moza::HidDevice& hid, const LinkOpt
 
     StatusBoard status;
     registerStatus(status);
+    if (options.versionText)
+    {
+        status.add("bridge.version", "Bridge", "Version");
+        status.setText("bridge.version", options.versionText());
+    }
+    if (options.checkForUpdates != nullptr)
+    {
+        *options.checkForUpdates = settings.enabled(kUpdatesKey);
+    }
 
     WebUi ui(settings, status, options.settingsPath);
     if (options.uiPort > 0)
@@ -327,10 +539,15 @@ int runLink(moza::as::Wheelbase& base, const moza::HidDevice& hid, const LinkOpt
     {
         return 4;
     }
-    std::puts("Linked. Forces follow the game; with no game they stay at the idle settings. Ctrl+C releases them.");
+    std::puts("Linked. Forces follow the game; with no game they stay at the idle settings.");
+    if (options.onStarted)
+    {
+        options.onStarted(ui.running() ? static_cast<int>(ui.port()) : 0);
+    }
+    std::string lastState;
 
     const auto modelInterval   = std::chrono::milliseconds(16);
-    const auto sendInterval    = std::chrono::milliseconds(50);
+    const auto sendInterval    = std::chrono::milliseconds(30);
     const auto refreshInterval = std::chrono::milliseconds(200);
     const auto rumbleInterval  = std::chrono::milliseconds(kRumbleDurationMs / 2);
     const auto statusInterval  = std::chrono::milliseconds(100);
@@ -351,6 +568,10 @@ int runLink(moza::as::Wheelbase& base, const moza::HidDevice& hid, const LinkOpt
     auto         nextPrint   = start;
     ForceOutput  output      = model.output();
     DeviceForces sent;
+    PitchServo   servo;
+    double       pitchPush   = 0.0;
+    YokeLights   lights;
+    auto         nextLightsAttach = start;
     int          sendErrors    = 0;
     bool         forcesWereOn  = status.forcesEnabled();
     TelemetryView view;
@@ -372,10 +593,30 @@ int runLink(moza::as::Wheelbase& base, const moza::HidDevice& hid, const LinkOpt
                 settingsRevision = settings.revision();
                 model.setSettings(forceSettingsFrom(settings));
             }
-            view      = reader.poll(now);
-            output    = model.update(view.fresh(), std::chrono::duration<double>(now - lastModel).count());
-            lastModel = now;
-            nextModel = now + modelInterval;
+            const double dt = std::chrono::duration<double>(now - lastModel).count();
+            view            = reader.poll(now);
+            output          = model.update(view.fresh(), dt);
+            lastModel       = now;
+            nextModel       = now + modelInterval;
+
+            // The sway needs to know where the yoke is; without that, or with it switched off, pitch
+            // is left to its spring exactly as before.
+            pitchPush = 0.0;
+            bool steering = false;
+            if (hid && status.forcesEnabled() && settings.get(kSwayKey) > 0.0)
+            {
+                auto [positionErr, state] = hid.getInputState();
+                if (positionErr == MOZA_ERR_NO_ERROR)
+                {
+                    const double position = (state.axes[MOZA_HA_Y].normalizedValue - 0.5) * 2.0;
+                    pitchPush = servo.update(pitchTargetFor(output, tuningFrom(settings, status, options.fullScale)), position, dt);
+                    steering  = true;
+                }
+            }
+            if (!steering)
+            {
+                servo.reset();
+            }
         }
 
         const bool forcesOn = status.forcesEnabled();
@@ -396,8 +637,8 @@ int runLink(moza::as::Wheelbase& base, const moza::HidDevice& hid, const LinkOpt
         {
             const bool everything    = now >= nextRefresh || justSwitchedOff;
             const bool restartRumble = now >= nextRumble;
-            if (!send(ffb, effects, toDeviceForces(output, tuningFrom(settings, status, options.fullScale)), sent, everything, restartRumble,
-                      options.fullScale))
+            if (!send(ffb, effects, toDeviceForces(output, tuningFrom(settings, status, options.fullScale), pitchPush), sent, everything,
+                      restartRumble, options.fullScale))
             {
                 ++sendErrors;
             }
@@ -411,6 +652,16 @@ int runLink(moza::as::Wheelbase& base, const moza::HidDevice& hid, const LinkOpt
                 nextRumble = now + rumbleInterval;
             }
         }
+
+        // The lights are only touched once the user has asked for them to follow the engine.
+        const LightTuning lightTuning = lightTuningFrom(settings);
+        if (lightTuning.followEngine && !lights.attached() && now >= nextLightsAttach)
+        {
+            lights.attach();
+            nextLightsAttach = now + std::chrono::seconds(3);
+        }
+        const LightTarget lightTarget = lightTargetFor(view.fresh(), lightTuning);
+        lights.show(lightTarget.level, lightTarget.heat, now);
 
         if (now >= nextTorque)
         {
@@ -428,9 +679,16 @@ int runLink(moza::as::Wheelbase& base, const moza::HidDevice& hid, const LinkOpt
             status.set("game.speed", live ? sample.speed * kKmhPerMs : 0.0);
             status.set("game.steer", live ? sample.steer : 0.0);
             status.set("game.mass", live ? sample.mass / 1000.0 : 0.0);
+            status.setText("game.surface", !live ? "-" : surfaceLabel(sample.surface));
             status.set("game.rough", live ? sample.rough : 0.0);
             status.set("game.slip", live ? sample.slip : 0.0);
+            status.set("game.bump", live ? sample.bumpRight - sample.bumpLeft : 0.0);
             status.setText("game.implement", !live ? "-" : sample.working ? "working" : sample.lowered ? "lowered" : "raised or none");
+            status.setText("game.engine", !live              ? "-"
+                                          : sample.electric  ? (sample.rpm > 0.0 ? "electric, on" : "electric, off")
+                                          : sample.starting  ? "starting"
+                                          : sample.rpm > 0.0 ? "running"
+                                                             : "off");
 
             if (hid)
             {
@@ -451,11 +709,39 @@ int runLink(moza::as::Wheelbase& base, const moza::HidDevice& hid, const LinkOpt
             status.set("force.rumble", sent.rumble * scale);
             status.set("force.rumble_hz", 1000.0 / std::max<std::uint32_t>(1, sent.rumblePeriodMs));
             status.set("force.pitch_hold", sent.pitchSpring * scale);
+            status.set("game.accel", live ? model.acceleration() : 0.0);
+            status.set("force.sway", sent.pitchCenter / static_cast<double>(std::max(1, options.fullScale)));
+            status.set("force.pitch_push", -sent.pitchPush * scale);
+            status.setText("yoke.lights", !lightTuning.followEngine ? "not following the engine"
+                                          : !lights.attached()      ? "no yoke handle found"
+                                                                    : "brightness " + std::to_string(lights.current()) + " of 15, colour " +
+                                                                          std::to_string(lights.color().r) + "," +
+                                                                          std::to_string(lights.color().g) + "," +
+                                                                          std::to_string(lights.color().b));
             status.set("bridge.send_errors", sendErrors);
+            if (options.versionText)
+            {
+                status.setText("bridge.version", options.versionText());
+            }
+            if (options.checkForUpdates != nullptr)
+            {
+                *options.checkForUpdates = settings.enabled(kUpdatesKey);
+            }
             nextStatus = now + statusInterval;
         }
 
-        if (now >= nextPrint)
+        if (now >= nextPrint && options.onStatus)
+        {
+            const std::string state = std::string(telemetryText(view)) + (forcesOn ? "" : " (forces off)");
+            if (state != lastState)
+            {
+                std::printf("Game: %s\n", state.c_str());
+                lastState = state;
+            }
+            options.onStatus(state);
+            nextPrint = now + printInterval;
+        }
+        else if (now >= nextPrint)
         {
             const double scale = 100.0 / std::max(1, options.fullScale);
             std::printf("[%6.0fs] %-22s | %5.1f km/h  steer %+.2f | centering %3.0f%%  weight %3.0f%%  pull %+4.0f%%  rumble %3.0f%% | forces %s\n",
@@ -471,6 +757,7 @@ int runLink(moza::as::Wheelbase& base, const moza::HidDevice& hid, const LinkOpt
 
     ui.stop();
     presence.remove();
+    lights.restore();
     ffb.stop();
     std::printf("Forces released. Updates that failed to send: %d.\n", sendErrors);
     return 0;

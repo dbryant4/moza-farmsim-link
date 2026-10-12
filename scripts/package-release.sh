@@ -1,7 +1,8 @@
 #!/bin/sh
 # Builds dist/moza-farmsim-link-<version>-windows.zip: everything a user installs, except
 # MOZA_SDK.dll, which is MOZA's to distribute (see docs/INSTALL.md).
-# Needs mingw-w64, cmake, ninja, lua and the MOZA SDK under sdk/ (see README.md).
+# Also builds dist/moza-farmsim-link-<version>-setup.exe, the installer.
+# Needs mingw-w64, makensis, cmake, ninja, lua and the MOZA SDK under sdk/ (see README.md).
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -24,11 +25,23 @@ name="moza-farmsim-link-$version-windows"
 stage="dist/$name"
 rm -rf "$stage" "dist/$name.zip"
 mkdir -p "$stage"
-cp bridge/build-win/moza_fs_bridge.exe "bridge/windows/Start FS25 yoke link.bat" fs-mod/dist/FS25_MozaYokeLink.zip "$stage/"
+cp bridge/build-win/moza_fs_link.exe bridge/build-win/moza_fs_bridge.exe fs-mod/dist/FS25_MozaYokeLink.zip "$stage/"
 cp docs/INSTALL.md "$stage/INSTALL.md"
 cp LICENSE "$stage/LICENSE.txt"
 (cd dist && zip -q -r "$name.zip" "$name")
+
+# The installer: the same files, plus a first-run page that takes MOZA's SDK zip from the user.
+setup="dist/moza-farmsim-link-$version-setup.exe"
+rm -f "$setup"
+# makensis aborts with bad_alloc while building its language tables when no locale is set.
+LC_ALL=en_US.UTF-8 makensis -V2 -DVERSION="$version" -DSOURCE="$PWD/$stage" -DOUTFILE="$PWD/$setup" installer/moza-farmsim-link.nsi
 rm -rf "$stage"
+
+# The mod on its own, for the other players in a multiplayer game: they need the same file and
+# nothing else. It keeps its name, because the game takes a mod's name from its zip.
+cp fs-mod/dist/FS25_MozaYokeLink.zip dist/FS25_MozaYokeLink.zip
 
 echo "built dist/$name.zip:"
 unzip -l "dist/$name.zip"
+echo "built $setup: $(wc -c < "$setup" | tr -d ' ') bytes"
+echo "built dist/FS25_MozaYokeLink.zip: $(wc -c < dist/FS25_MozaYokeLink.zip | tr -d ' ') bytes"

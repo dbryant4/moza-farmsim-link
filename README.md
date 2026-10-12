@@ -10,9 +10,9 @@ yoke's roll axis used as steering.
 | `docs/telemetry.md` | The telemetry file format both sides are built against. |
 | `sdk/` | Where the MOZA SDK goes. **Not included in this repository**; see "Getting the MOZA SDK". |
 
-Version 0.1.1. Built for and tested on a MOZA AY210 yoke base with FS25 1.24 on Windows 11.
+Version 0.1.2. Built for and tested on a MOZA AY210 yoke base with FS25 1.24 on Windows 11.
 
-**To just use it**, download the zip from the [latest release](https://github.com/dbryant4/moza-farmsim-link/releases/latest) and follow [docs/INSTALL.md](docs/INSTALL.md).
+**To just use it**, run the installer from the [latest release](https://github.com/dbryant4/moza-farmsim-link/releases/latest) and follow [docs/INSTALL.md](docs/INSTALL.md). It keeps itself up to date from there: when a newer release is published here, the icon by the clock offers to install it.
 
 ## Status
 
@@ -31,15 +31,21 @@ Every part works on the real hardware, and the mod has been driven in the game:
 
 1. Close X-Plane and any other flight simulator. The bridge refuses to start while one is running,
    because its start-up reset would cut that simulator's forces.
-2. On the PC, run `Start FS25 yoke link.bat` in the folder the bridge was copied to. It starts the
-   bridge and opens the settings page, http://127.0.0.1:8777/. The yoke gets a light centering.
+2. On the PC, run `moza_fs_link.exe`. No window opens: it puts a steering-wheel icon by the clock
+   (on Windows 11 new icons start in the `^` overflow; drag it out to keep it visible) and the yoke
+   gets a light centering. Click the icon to open the settings page, http://127.0.0.1:8777/.
 3. Start FS25. When loading the savegame, tick **MOZA Yoke Link** in the mod list.
 4. Get in a vehicle and drive. The page's status should change to "live, driving".
 5. Tune with the sliders; changes apply at once. **Save** keeps them for next time
    (`moza_fs_bridge.ini` next to the program).
 
-To stop: Ctrl+C in the bridge window, or close it. The page's **Release forces** button drops all
-forces without stopping the bridge.
+To stop: right-click the icon and choose Exit. The page's **Release forces** button drops all
+forces without stopping the bridge. Starting `moza_fs_link.exe` again while it is running just opens
+the settings page; `moza_fs_link.exe --quit` stops it from a script. What it prints goes to
+`moza_fs_bridge.log` beside the program (right-click the icon, *Open log file*).
+
+`moza_fs_bridge.exe` is the same bridge as a console program. Use it for the test options below,
+or for the link itself if you want to watch its once-a-second status line.
 
 ### What the bridge does and does not touch
 
@@ -114,10 +120,14 @@ cmake -S bridge -B bridge/build-win -G Ninja --toolchain cmake/mingw-w64-x86_64.
 ```
 
 ```bash
-scp bridge/build-win/moza_fs_bridge.exe bridge/build-win/MOZA_SDK.dll "bridge/windows/Start FS25 yoke link.bat" <pc>:moza-farmsim-link/
+scp bridge/build-win/moza_fs_link.exe bridge/build-win/moza_fs_bridge.exe bridge/build-win/MOZA_SDK.dll <pc>:moza-farmsim-link/
 ```
 
-`scripts/package-release.sh` builds the release zip (exe, launcher, mod, install guide) in `dist/`.
+`scripts/package-release.sh` builds what a release carries, in `dist/`: the installer
+(`moza-farmsim-link-<version>-setup.exe`, made with NSIS: `brew install makensis`), a zip of the
+same files, and the mod on its own (`FS25_MozaYokeLink.zip`) for other players in a multiplayer
+game. The installer carries the mod and puts it in the game's mods folder. The program finds new versions through GitHub's "latest release" of this repository
+and installs the file there whose name ends in `-setup.exe`, so every release needs one attached.
 
 The mod is packaged by `fs-mod/package.sh` and installed by copying the zip into FS25's mods folder:
 
@@ -130,7 +140,8 @@ is set up in `CMakeLists.txt` but has never been tried.
 
 ## Test modes (no game needed)
 
-Run from the bridge's folder on the PC. All but `--list` apply force, so keep clear of the yoke.
+Run `moza_fs_bridge.exe` from a terminal in the bridge's folder on the PC, with the windowless link
+not running. All but `--list` apply force, so keep clear of the yoke.
 
 ```bash
 .\moza_fs_bridge.exe --list
@@ -201,6 +212,41 @@ spring scale 34%, damper scale 20%, torque limit 100%).
 
 ## Still to find out
 
+0. **The installer and updates (new in 0.1.2).** Checked on the PC without a desktop: a silent
+   install with MOZA's Flight SDK 1.0.0.4 zip, an update over the top, a silent uninstall, and the
+   question to GitHub about the latest release. Not yet seen or run: the installer's pages, the
+   update entries in the icon's menu, and a whole update from one release to the next, which
+   needs two published releases with an installer attached. `moza_fs_bridge.exe --fetch-update`
+   downloads and verifies the latest release's installer without running it. MOZA's current
+   Flight SDK download is 1.0.0.6; only 1.0.0.4 has been used.
+0. **The rest of 0.1.2.** One session in FS25 (2026-10-11) showed the mod's side working: each
+   machine's own engine speed range, electric vehicles told apart, and wheel bumps detected. How
+   the forces feel, and the pitch sway on the real yoke, still need the owner's verdict:
+   - *Engine start shake*, and no engine vibration for electric vehicles. The settings page shows
+     what the mod reports under *Engine* (off, starting, running, electric).
+   - *Obstacle kick*: the wheel jerks toward the side whose front wheel hits a log or kerb, less
+     for heavier machines. *Thump* and *wiggle*: a short in-out and left-right shake when both
+     front wheels are jolted together, as on rail tracks. These depend on the mod spotting a wheel
+     load spike; its thresholds are first guesses, and FS25's `log.txt` gets `first strong bump`
+     and `bump check` lines to calibrate them from.
+   - *Surface patterns*: the mod reports what kind of ground the wheels are on (`surface`) and the
+     bridge gives each its own rumble: where in the frequency band it sits, how lumpy it is, a
+     pulse per ridge, and small pulls on the wheel on broken ground. The patterns are in
+     `kPatterns` in `bridge/src/force_model.cpp` and are first guesses: none has been felt on the
+     yoke, and whether FS25 reports ridges and tilled ground the way the mod expects is unchecked
+     (the settings page shows the reported surface under *Game*).
+   - *Acceleration sway*: pitch leans out when pulling away and in when braking. Pitch has too
+     much friction for a plain push, so a small position controller moves it; it is tuned against
+     a simulated axis only.
+   - *Yoke lights follow the engine* (off by default): dark with the engine off, dim at idle,
+     full brightness at the top of each machine's own engine speed range, with the colour moving
+     from yours through amber to red over the last part of it. The handle has one brightness and
+     one colour for all its lights and no per-hat control. Unlike the forces this writes values the
+     handle stores; the bridge restores what it found when it stops, but whether each write wears
+     the handle's memory is unknown, so writes are limited to step changes a few times a second.
+   - *The tray icon* has been checked on the PC only as far as a remote session can see (no
+     window, settings page up, second start and `--quit` behave); the icon and its menu have not
+     been looked at.
 0. **Bridge detection in the game (new in 0.1.1, not yet run in FS25).** With the bridge running,
    FS25's `log.txt` should show `[MozaYokeLink] bridge detected` within a couple of seconds, and
    `bridge gone` after the bridge stops. If it never appears, the mod simply leaves the game's

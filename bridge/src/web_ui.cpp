@@ -39,7 +39,8 @@ using Clock = std::chrono::steady_clock;
 // Limits on what one client may send and how long it may take. A request for this API is a few
 // hundred bytes and arrives at once, so anything near these is a mistake or an attack.
 constexpr std::size_t kMaxHeaderBytes = 8 * 1024;
-constexpr std::size_t kMaxBodyBytes   = 16 * 1024;
+// Room for an imported settings file several times the size of the one this program writes.
+constexpr std::size_t kMaxBodyBytes   = 64 * 1024;
 constexpr std::size_t kMaxConnections = 32;
 constexpr std::size_t kMaxDrainBytes  = 256 * 1024;
 constexpr auto        kRequestTimeout = std::chrono::milliseconds(2000);
@@ -539,6 +540,8 @@ constexpr Route kRoutes[] = {
     {"/api/save", "POST"},
     {"/api/revert", "POST"},
     {"/api/reset", "POST"},
+    {"/api/export", "GET"},
+    {"/api/import", "POST"},
     {"/api/forces", "POST"},
     {"/api/release", "POST"},
 };
@@ -805,6 +808,33 @@ std::string WebUi::Impl::respond(const Request& request)
     {
         settings.resetToDefaults();
         return okResponse("Everything is back at its default");
+    }
+    if (request.path == "/api/export")
+    {
+        // As a download rather than a page, under a name that says what it is.
+        return makeResponse(200, "text/plain; charset=utf-8", settings.exportText(),
+                            "Content-Disposition: attachment; filename=\"moza-fs-link-settings.ini\"\r\n");
+    }
+    if (request.path == "/api/import")
+    {
+        Settings::ImportResult imported = settings.importText(request.body);
+        if (imported.applied == 0)
+        {
+            return plainResponse(400, "nothing changed: that is not a settings file from this program");
+        }
+        // A file that is mostly something else would otherwise answer with a line per line of it.
+        constexpr std::size_t kMostWarnings = 8;
+        if (imported.warnings.size() > kMostWarnings)
+        {
+            const std::size_t more = imported.warnings.size() - kMostWarnings;
+            imported.warnings.resize(kMostWarnings);
+            imported.warnings.push_back("and " + std::to_string(more) + " more");
+        }
+        const std::string count = imported.applied == 1 ? "1 setting" : std::to_string(imported.applied) + " settings";
+        return okResponse(imported.changed == 0 ? "Imported " + count + ": all the same as now"
+                                                : "Imported " + count + ", " + std::to_string(imported.changed) +
+                                                      " changed. In effect now; press Save to keep them",
+                          &imported.warnings);
     }
     if (request.path == "/api/forces")
     {

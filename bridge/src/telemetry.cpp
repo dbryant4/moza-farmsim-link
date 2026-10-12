@@ -8,6 +8,14 @@
 #include <system_error>
 #include <utility>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <shlobj.h>
+#endif
+
 namespace bridge {
 
 namespace {
@@ -51,6 +59,13 @@ bool parseFlag(std::string_view text, bool fallback)
 {
     const auto value = parseReal(text);
     return value ? *value != 0.0 : fallback;
+}
+
+/** A number this version does not know is a surface it has no pattern for, not an error. */
+Surface parseSurface(std::string_view text)
+{
+    const auto code = parseInteger<int>(text);
+    return code && *code > 0 && *code < kSurfaceCount ? static_cast<Surface>(*code) : Surface::Unknown;
 }
 
 } // namespace
@@ -115,11 +130,18 @@ std::optional<Telemetry> parseTelemetry(std::string_view line)
         else if (key == "mass") sample.mass = parseReal(value).value_or(defaults.mass);
         else if (key == "rpm") sample.rpm = parseReal(value).value_or(defaults.rpm);
         else if (key == "load") sample.load = parseReal(value).value_or(defaults.load);
+        else if (key == "rpmmin") sample.rpmMin = parseReal(value).value_or(defaults.rpmMin);
+        else if (key == "rpmmax") sample.rpmMax = parseReal(value).value_or(defaults.rpmMax);
         else if (key == "slip") sample.slip = parseReal(value).value_or(defaults.slip);
         else if (key == "rough") sample.rough = parseReal(value).value_or(defaults.rough);
+        else if (key == "surface") sample.surface = parseSurface(value);
         else if (key == "field") sample.field = parseFlag(value, defaults.field);
         else if (key == "lowered") sample.lowered = parseFlag(value, defaults.lowered);
         else if (key == "working") sample.working = parseFlag(value, defaults.working);
+        else if (key == "starting") sample.starting = parseFlag(value, defaults.starting);
+        else if (key == "electric") sample.electric = parseFlag(value, defaults.electric);
+        else if (key == "bumpl") sample.bumpLeft = parseReal(value).value_or(defaults.bumpLeft);
+        else if (key == "bumpr") sample.bumpRight = parseReal(value).value_or(defaults.bumpRight);
     }
 
     if (!haveSeq)
@@ -164,7 +186,10 @@ const TelemetryView& TelemetryReader::poll(Clock::time_point now)
     return m_view;
 }
 
-std::optional<Telemetry> TelemetryReader::read() const
+namespace {
+
+/** The file's bytes as of one open-read-close, or nothing if it cannot be opened or is too long to be ours. */
+std::optional<std::string> readOnce(const std::filesystem::path& path)
 {
     // Standard streams only, so the same code runs on Windows and in the macOS tests. On Windows
     // both libstdc++ (mingw-w64) and the MSVC STL open through the C runtime's _wfopen/_wfsopen
@@ -175,7 +200,7 @@ std::optional<Telemetry> TelemetryReader::read() const
     // If the writer holds the file exclusively the open fails and the previous sample stands.
     //
     // Binary mode keeps the runtime from translating line endings or treating Ctrl+Z as end of file.
-    std::ifstream file(m_path, std::ios::binary);
+    std::ifstream file(path, std::ios::binary);
     if (!file)
     {
         return std::nullopt;
@@ -189,24 +214,68 @@ std::optional<Telemetry> TelemetryReader::read() const
         // Possibly cut short by the buffer, so its ending proves nothing.
         return std::nullopt;
     }
-    // A read racing the writer sees an empty or truncated line, which the parser's framing rejects.
-    return parseTelemetry(std::string_view(buffer, size));
+    return std::string(buffer, size);
 }
 
-std::filesystem::path defaultTelemetryPath()
+} // namespace
+
+std::optional<Telemetry> TelemetryReader::read() const
+{
+    // A read racing the writer usually sees an empty or truncated line, which the parser's framing
+    // rejects. But the file is rewritten in place, and one read can also come back as the head of
+    // one line joined to the tail of the next, with both frame markers intact and a number in the
+    // middle that neither line contained. So read twice and take the sample only if both reads
+    // agree: a write landing during either one makes them differ, and the next poll gets the new line.
+    const auto first = readOnce(m_path);
+    if (!first)
+    {
+        return std::nullopt;
+    }
+    const auto second = readOnce(m_path);
+    if (!second || *second != *first)
+    {
+        return std::nullopt;
+    }
+    return parseTelemetry(*first);
+}
+
+std::filesystem::path defaultGameFolder()
 {
 #ifdef _WIN32
-    // The wide environment, so a profile name outside the ANSI code page survives.
-    const wchar_t* const profile = _wgetenv(L"USERPROFILE");
+    // The game keeps its folder under the user's Documents, wherever Windows has that: with
+    // OneDrive's folder backup on, it is not the Documents folder inside the user profile.
+    std::filesystem::path documents;
+    PWSTR                 known = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, KF_FLAG_DEFAULT, nullptr, &known)) && known != nullptr)
+    {
+        documents = known;
+    }
+    CoTaskMemFree(known);
+    if (documents.empty())
+    {
+        // The wide environment, so a profile name outside the ANSI code page survives.
+        const wchar_t* const profile = _wgetenv(L"USERPROFILE");
+        if (profile == nullptr || *profile == 0)
+        {
+            return {};
+        }
+        documents = std::filesystem::path(profile) / "Documents";
+    }
 #else
     const char* const profile = std::getenv("USERPROFILE");
-#endif
     if (profile == nullptr || *profile == 0)
     {
         return {};
     }
-    return std::filesystem::path(profile) / "Documents" / "My Games" / "FarmingSimulator2025" / "modSettings" /
-           "FS25_MozaYokeLink" / "telemetry.txt";
+    const std::filesystem::path documents = std::filesystem::path(profile) / "Documents";
+#endif
+    return documents / "My Games" / "FarmingSimulator2025";
+}
+
+std::filesystem::path defaultTelemetryPath()
+{
+    const std::filesystem::path game = defaultGameFolder();
+    return game.empty() ? game : game / "modSettings" / "FS25_MozaYokeLink" / "telemetry.txt";
 }
 
 } // namespace bridge

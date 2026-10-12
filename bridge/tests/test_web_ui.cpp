@@ -314,6 +314,75 @@ void testSaveLoadRoundTrip()
     CHECK(!read.dirty());
 }
 
+void testExportAndImport()
+{
+    TempDir        dir;
+    const fs::path file = dir.path / "settings.ini";
+
+    // What is exported is what Save writes, at the current values whether saved or not.
+    bridge::Settings source;
+    registerSample(source);
+    CHECK(source.set("roll.spring", 64));
+    CHECK(source.set("rumble.on", 0));
+    const std::string exported = source.exportText();
+    CHECK(contains(exported, "roll.spring = 64") && contains(exported, "roll.damper = 20") && contains(exported, "rumble.on = false"));
+    CHECK(source.dirty());
+    CHECK(source.save(file));
+    CHECK(readFile(file) == exported);
+
+    // Importing that on another machine reproduces it, as unsaved changes.
+    bridge::Settings target;
+    registerSample(target);
+    CHECK(target.set("roll.damper", 55));
+    CHECK(target.save(file));
+    const auto before = target.revision();
+    auto       result = target.importText(exported);
+    CHECK(result.applied == 3 && result.changed == 3 && result.warnings.empty());
+    CHECK(target.get("roll.spring") == 64 && target.get("roll.damper") == 20 && !target.enabled("rumble.on"));
+    CHECK(target.revision() == before + 1);
+    CHECK(target.dirty());
+    for (const auto& state : target.snapshot())
+    {
+        // Nothing was written: a restart, or Revert, still gives what was saved before.
+        CHECK(state.saved == (state.info.key == "roll.damper" ? 55 : state.info.defaultValue));
+    }
+    CHECK(target.load(file).ok && target.get("roll.damper") == 55 && target.get("roll.spring") == 30);
+
+    // The same again changes nothing and is not counted as a change.
+    CHECK(target.importText(exported).changed == 3);
+    const auto settledAt = target.revision();
+    result                = target.importText(exported);
+    CHECK(result.applied == 3 && result.changed == 0 && target.revision() == settledAt);
+
+    // A setting the file does not mention is left as it is: a file from an older version, or part of one.
+    CHECK(target.set("roll.spring", 11));
+    result = target.importText("roll.damper = 70\n");
+    CHECK(result.applied == 1 && result.changed == 1);
+    CHECK(target.get("roll.spring") == 11 && target.get("roll.damper") == 70 && !target.enabled("rumble.on"));
+
+    // As lenient as loading: Windows line endings, a byte order mark, comments, values out of range,
+    // settings this version does not have, and lines that are not settings at all.
+    result = target.importText("\xEF\xBB\xBF# from a friend\r\nroll.spring = 250   # too much\r\n; note\r\nfuture.setting = 3\r\n"
+                               "roll.damper = heavy\r\nrumble.on = yes\r\nnot a setting\r\n");
+    CHECK(result.applied == 2 && result.changed == 2);
+    CHECK(target.get("roll.spring") == 100 && target.get("roll.damper") == 70 && target.enabled("rumble.on"));
+    CHECK(result.warnings.size() == 4);
+    CHECK(contains(result.warnings[0], "line 2") && contains(result.warnings[0], "using 100"));
+    CHECK(contains(result.warnings[1], "line 4") && contains(result.warnings[1], "unknown setting"));
+    CHECK(contains(result.warnings[2], "line 5") && contains(result.warnings[2], "roll.damper"));
+    CHECK(contains(result.warnings[3], "line 7"));
+
+    // Something that is not a settings file touches nothing.
+    const auto untouched = target.revision();
+    for (const std::string& other : {std::string(), std::string("\n\n# only a comment\n"), std::string("<html><body>hello</body></html>"),
+                                     std::string("\x89PNG\r\n\x1a\n\0\0\0\rIHDR=", 18), std::string("some.other.program = 1\nvalue = 2\n")})
+    {
+        result = target.importText(other);
+        CHECK(result.applied == 0 && result.changed == 0);
+    }
+    CHECK(target.revision() == untouched && target.get("roll.spring") == 100);
+}
+
 void testTolerantLoad()
 {
     TempDir        dir;
@@ -1192,6 +1261,66 @@ void testActions()
     CHECK(!server.settings.dirty());
 }
 
+void testExportAndImportEndpoints()
+{
+    Server server;
+    CHECK(post(server.port, "/api/set", "roll.spring=64\nrumble.on=off").status == 200);
+
+    // Export: the current values as a file to download, unsaved ones included.
+    Reply reply = get(server.port, "/api/export");
+    CHECK(reply.status == 200);
+    CHECK(reply.hasHeader("Content-Type: text/plain; charset=utf-8"));
+    CHECK(reply.hasHeader("Content-Disposition: attachment; filename=\"moza-fs-link-settings.ini\""));
+    CHECK(reply.body == server.settings.exportText());
+    CHECK(contains(reply.body, "roll.spring = 64") && contains(reply.body, "rumble.on = false"));
+    const std::string exported = reply.body;
+    CHECK(post(server.port, "/api/export", "").status == 405);
+    CHECK(get(server.port, "/api/import").status == 405);
+
+    // Import: back to those values from anywhere else, in effect but not saved.
+    CHECK(post(server.port, "/api/reset", "").status == 200);
+    CHECK(post(server.port, "/api/save", "").status == 200);
+    CHECK(server.settings.get("roll.spring") == 30 && !server.settings.dirty());
+    reply = post(server.port, "/api/import", exported);
+    CHECK(reply.status == 200 && isJson(reply.body));
+    CHECK(server.settings.get("roll.spring") == 64 && !server.settings.enabled("rumble.on"));
+    CHECK(fieldOf(reply.body, "roll.spring", "value") == "64" && fieldOf(reply.body, "roll.spring", "saved") == "30");
+    CHECK(contains(reply.body, "\"dirty\":true"));
+    CHECK(contains(reply.body, "Imported 3 settings, 2 changed") && contains(reply.body, "\"warnings\":[]"));
+    CHECK(contains(post(server.port, "/api/import", exported).body, "Imported 3 settings: all the same as now"));
+
+    // What the file gets wrong is reported and the rest still applies; a flood of it is cut short.
+    reply = post(server.port, "/api/import", "roll.spring = 12\nroll.damper = 900\nold.setting = 1\n");
+    CHECK(reply.status == 200 && server.settings.get("roll.spring") == 12 && server.settings.get("roll.damper") == 100);
+    CHECK(contains(reply.body, "using 100") && contains(reply.body, "unknown setting"));
+    std::string noisy = "roll.spring = 13\n";
+    for (int i = 0; i < 200; ++i)
+    {
+        noisy += "<img src=x onerror=alert(" + std::to_string(i) + ")> = \"quoted\"\n";
+    }
+    reply = post(server.port, "/api/import", noisy);
+    CHECK(reply.status == 200 && isJson(reply.body) && server.settings.get("roll.spring") == 13);
+    CHECK(contains(reply.body, "and 192 more") && reply.body.size() < 8000);
+
+    // A file that is something else changes nothing and says so.
+    const auto settled = server.settings.revision();
+    for (const std::string& other : {std::string(), std::string("just some text\n"), std::string(3000, '\xff'), std::string("a = 1\nb = 2\n")})
+    {
+        reply = post(server.port, "/api/import", other);
+        CHECK(reply.status == 400 && contains(reply.body, "not a settings file"));
+    }
+    CHECK(post(server.port, "/api/import", exported + std::string(70000, '#')).status == 413);
+    CHECK(server.settings.revision() == settled);
+
+    // Like every other change, only this server's own page may ask for it.
+    CHECK(post(server.port, "/api/import", exported, "Origin: http://evil.example\r\n").status == 403);
+    CHECK(server.settings.revision() == settled);
+
+    // The page offers both.
+    const std::string page = get(server.port, "/").body;
+    CHECK(contains(page, "href=\"/api/export\"") && contains(page, "id=\"import\"") && contains(page, "'/api/import'"));
+}
+
 void testSaveFailureIsReported()
 {
     TempDir             dir;
@@ -1507,6 +1636,7 @@ int main()
     testChangeCounter();
     testDirtyFlag();
     testSaveLoadRoundTrip();
+    testExportAndImport();
     testTolerantLoad();
     testMissingAndUnreadableFile();
     testAtomicSave();
@@ -1518,6 +1648,7 @@ int main()
     testState();
     testSetEndpoint();
     testActions();
+    testExportAndImportEndpoints();
     testSaveFailureIsReported();
     testRejections();
     testSlowAndIdleClients();

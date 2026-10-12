@@ -7,6 +7,7 @@
 #include "moza/moza.h"
 
 #include <map>
+#include <utility>
 #include <vector>
 
 namespace fake_moza {
@@ -32,6 +33,14 @@ struct State
     bool                     acceptEffects = true;
     /** Number of Moza_DeviceGetList calls that see no devices before the base appears. */
     int                      emptyDeviceListCalls = 0;
+    /** When true a yoke handle (a stick device, id 2) is listed after the base. */
+    bool                     handlePresent        = false;
+    /** Every parameter write as {id, value}, in order. A list write is recorded by its first value here. */
+    std::vector<std::pair<int, long long>> parameterWrites;
+    /** Parameters whose value is a list, such as an r,g,b colour; these win over `parameters`. */
+    std::map<int, std::vector<long long>> listParameters;
+    /** Every list write as {id, values}, in order. */
+    std::vector<std::pair<int, std::vector<long long>>> listWrites;
     int                      openHandles          = 0;
     bool                     initialized          = false;
 };

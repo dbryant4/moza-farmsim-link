@@ -1,6 +1,7 @@
 // Checks the telemetry parser, the file reader and the force model. None of them touch the device.
 
 #include "force_model.hpp"
+#include "pitch_servo.hpp"
 #include "telemetry.hpp"
 
 #include <algorithm>
@@ -24,6 +25,7 @@ namespace {
 using bridge::ForceModel;
 using bridge::ForceOutput;
 using bridge::ForceSettings;
+using bridge::Surface;
 using bridge::Telemetry;
 using bridge::TelemetryReader;
 using bridge::TelemetryState;
@@ -142,6 +144,41 @@ void testIgnoresUnknownKeysAndDefaultsMissingOnes()
     // active=0 with everything else omitted, as the mod writes while the player is on foot.
     const auto onFoot = parseTelemetry("MOZAFS 1 seq=8 active=0 end=1\n");
     CHECK(onFoot && !onFoot->active && onFoot->speed == 0.0 && onFoot->mass == 0.0 && !onFoot->working);
+
+    // The engine keys added after the first release: absent means a combustion engine that is not starting.
+    CHECK(onFoot && !onFoot->starting && !onFoot->electric);
+    const auto cranking = parseTelemetry("MOZAFS 1 seq=8 active=1 starting=1 electric=0 end=1\n");
+    CHECK(cranking && cranking->starting && !cranking->electric);
+    const auto batteryPowered = parseTelemetry("MOZAFS 1 seq=8 active=1 electric=1 rpm=3000 end=1\n");
+    CHECK(batteryPowered && batteryPowered->electric && !batteryPowered->starting && batteryPowered->rpm == 3000.0);
+
+    const auto ranged = parseTelemetry("MOZAFS 1 seq=8 active=1 rpm=1400 rpmmin=850 rpmmax=1900 end=1\n");
+    CHECK(ranged && ranged->rpmMin == 850.0 && ranged->rpmMax == 1900.0 && ranged->rpm == 1400.0);
+    CHECK(onFoot && onFoot->rpmMin == 0.0 && onFoot->rpmMax == 0.0);
+
+    const auto bumped = parseTelemetry("MOZAFS 1 seq=8 active=1 bumpl=0.25 bumpr=1.00 end=1\n");
+    CHECK(bumped && bumped->bumpLeft == 0.25 && bumped->bumpRight == 1.0);
+    CHECK(onFoot && onFoot->bumpLeft == 0.0 && onFoot->bumpRight == 0.0);
+
+    // The kind of surface, added later still: a number from the contract's list, anything else unknown.
+    CHECK(onFoot && onFoot->surface == Surface::Unknown);
+    const auto surfaceOf = [](const std::string& value) {
+        const auto parsed = parseTelemetry("MOZAFS 1 seq=8 active=1 rough=0.85 surface=" + value + " field=1 end=1\n");
+        CHECK(parsed && parsed->rough == 0.85 && parsed->field);
+        return parsed ? parsed->surface : Surface::Unknown;
+    };
+    CHECK(surfaceOf("1") == Surface::Road);
+    CHECK(surfaceOf("2") == Surface::Gravel);
+    CHECK(surfaceOf("3") == Surface::Grass);
+    CHECK(surfaceOf("4") == Surface::Snow);
+    CHECK(surfaceOf("5") == Surface::Heap);
+    CHECK(surfaceOf("6") == Surface::Field);
+    CHECK(surfaceOf("7") == Surface::Tilled);
+    CHECK(surfaceOf("8") == Surface::Ridge);
+    for (const char* unknown : {"0", "9", "-1", "250", "7.5", "tilled", "99999999999999999999"})
+    {
+        CHECK(surfaceOf(unknown) == Surface::Unknown);
+    }
 
     // Order does not matter, and a repeated key takes its last value.
     const auto reordered = parseTelemetry("MOZAFS 1 speed=1 active=1 speed=2 seq=9 end=1\n");
@@ -731,6 +768,260 @@ void testRumbleFollowsSurfaceAndSpeed()
     CHECK(near(rumbleAt(60.0, 0.7).rumbleHz, settings.rumbleMaxHz, 1e-6));
 }
 
+/** The tractor on @p surface at @p speed, with the roughness the mod reports for that kind of ground. */
+Telemetry drivingOn(Surface surface, double speed, double rough)
+{
+    Telemetry telemetry = driving(speed);
+    telemetry.surface   = surface;
+    telemetry.rough     = rough;
+    telemetry.field     = surface == Surface::Field || surface == Surface::Tilled || surface == Surface::Ridge;
+    return telemetry;
+}
+
+struct Driven
+{
+    double lowestTexture  = 1.0;
+    double highestTexture = 0.0;
+    double lowestKick     = 0.0;
+    double highestKick    = 0.0;
+    /** Times the texture fell through its midpoint. */
+    int         dips = 0;
+    ForceOutput last;
+};
+
+/** Drives @p telemetry for @p seconds after letting the forces settle, and reports what the texture and the tug did. */
+Driven drive(const Telemetry& telemetry, const ForceSettings& settings = {}, double seconds = 20.0, double step = 0.01)
+{
+    ForceModel model(settings);
+    settle(model, &telemetry, 3.0);
+    Driven result;
+    result.lowestKick = result.highestKick = model.output().rollKick;
+    bool high = true;
+    for (int i = 0; i < std::lround(seconds / step); ++i)
+    {
+        const ForceOutput out = model.update(&telemetry, step);
+        result.lowestTexture  = std::min(result.lowestTexture, out.rumbleTexture);
+        result.highestTexture = std::max(result.highestTexture, out.rumbleTexture);
+        result.lowestKick     = std::min(result.lowestKick, out.rollKick);
+        result.highestKick    = std::max(result.highestKick, out.rollKick);
+        if (high && out.rumbleTexture < 0.5)
+        {
+            high = false;
+            ++result.dips;
+        }
+        else if (!high && out.rumbleTexture > 0.7)
+        {
+            high = true;
+        }
+        result.last = out;
+    }
+    return result;
+}
+
+void testEachSurfaceHasItsOwnRumble()
+{
+    const ForceSettings settings;
+
+    // A mod that does not say what the ground is, and patterns switched off, both give the plain
+    // rumble there was before: steady, across the whole band, with no pull on the wheel.
+    Telemetry unnamed = driving(6.0);
+    unnamed.rough     = 0.85;
+    const Driven plain = drive(unnamed);
+    CHECK(plain.lowestTexture == 1.0 && plain.highestTexture == 1.0);
+    CHECK(plain.lowestKick == 0.0 && plain.highestKick == 0.0);
+    ForceSettings switchedOff;
+    switchedOff.surfacePatterns = false;
+    const Driven off = drive(drivingOn(Surface::Tilled, 6.0, 0.85), switchedOff);
+    CHECK(off.lowestTexture == 1.0 && off.highestTexture == 1.0 && off.lowestKick == 0.0 && off.highestKick == 0.0);
+    CHECK(near(off.last.rumble, plain.last.rumble, 1e-9) && near(off.last.rumbleHz, plain.last.rumbleHz, 1e-9));
+
+    // Paved ground gives nothing unless asked to, and then a faint buzz at the fast end of the band.
+    CHECK(near(settled(drivingOn(Surface::Road, 15.0, 0.0)).rumble, 0.0, 1e-9));
+    ForceSettings buzzing;
+    buzzing.surfaceRoad = 1.0;
+    const ForceOutput road = settled(drivingOn(Surface::Road, 15.0, 0.0), buzzing);
+    CHECK(road.rumble > 0.0 && road.rumble < 0.25 * settings.rumbleSurface);
+    CHECK(road.rumbleHz > settings.rumbleMinHz + 0.9 * (settings.rumbleMaxHz - settings.rumbleMinHz));
+    CHECK(road.rumbleTexture == 1.0);
+
+    // At one speed, each kind of ground sits at its own pitch: gravel buzzes, a ploughed field thuds.
+    const auto hzOn = [](Surface surface) { return settled(drivingOn(surface, 5.0, 0.7)).rumbleHz; };
+    CHECK(hzOn(Surface::Gravel) > hzOn(Surface::Field) + 2.0);
+    CHECK(hzOn(Surface::Field) > hzOn(Surface::Grass) + 1.0);
+    CHECK(hzOn(Surface::Grass) > hzOn(Surface::Snow) + 0.5);
+    CHECK(hzOn(Surface::Field) > hzOn(Surface::Tilled) + 2.0);
+    CHECK(hzOn(Surface::Field) > hzOn(Surface::Ridge) + 1.0);
+    // ... and still rises with speed on every one of them, inside the band.
+    for (int i = 1; i < bridge::kSurfaceCount; ++i)
+    {
+        const auto surface = static_cast<Surface>(i);
+        ForceSettings all;
+        all.surfaceRoad         = 1.0;
+        const ForceOutput slow  = settled(drivingOn(surface, 1.0, 0.7), all);
+        const ForceOutput quick = settled(drivingOn(surface, 12.0, 0.7), all);
+        CHECK(quick.rumbleHz > slow.rumbleHz);
+        CHECK(withinRanges(slow) && withinRanges(quick));
+    }
+
+    // The strength per surface multiplies what the roughness gives.
+    ForceSettings halfGravel;
+    halfGravel.surfaceGravel = 0.5;
+    CHECK(near(settled(drivingOn(Surface::Gravel, 6.0, 0.3), halfGravel).rumble, 0.5 * settled(drivingOn(Surface::Gravel, 6.0, 0.3)).rumble, 1e-9));
+    CHECK(near(settled(drivingOn(Surface::Grass, 6.0, 0.5)).rumble, settings.surfaceGrass * settled(drivingOn(Surface::Unknown, 6.0, 0.5)).rumble, 1e-9));
+    ForceSettings noSnow;
+    noSnow.surfaceSnow = 0.0;
+    CHECK(near(settled(drivingOn(Surface::Snow, 6.0, 0.4), noSnow).rumble, 0.0, 1e-9));
+}
+
+void testRoughGroundComesAndGoesUnderTheWheels()
+{
+    const ForceSettings settings;
+
+    // A ploughed field is lumpy: the rumble swells and sinks, but never by more than the pattern allows.
+    const Driven tilled = drive(drivingOn(Surface::Tilled, 4.0, 1.0));
+    CHECK(tilled.highestTexture > 0.9 && tilled.highestTexture <= 1.0);
+    CHECK(tilled.lowestTexture < 0.5 && tilled.lowestTexture >= 0.3 - 1e-9);
+    // A sown field is nearly even, and gravel is in between.
+    const Driven sown   = drive(drivingOn(Surface::Field, 4.0, 0.7));
+    const Driven gravel = drive(drivingOn(Surface::Gravel, 4.0, 0.3));
+    CHECK(sown.lowestTexture >= 0.8 - 1e-9 && sown.lowestTexture < 0.95);
+    CHECK(gravel.lowestTexture >= 0.65 - 1e-9 && gravel.lowestTexture < sown.lowestTexture);
+
+    // Ridges pass one by one, 0.75 m apart: at 1.5 m/s that is two a second.
+    const Driven ridges = drive(drivingOn(Surface::Ridge, 1.5, 0.9), settings, 20.0);
+    CHECK(ridges.dips >= 38 && ridges.dips <= 42);
+    // Twice as fast, twice as many; and at road speed they stop short of a blur.
+    CHECK(drive(drivingOn(Surface::Ridge, 3.0, 0.9), settings, 10.0).dips >= 38);
+    const Driven flatOut = drive(drivingOn(Surface::Ridge, 15.0, 0.9), settings, 10.0);
+    CHECK(flatOut.dips >= 55 && flatOut.dips <= 62);
+
+    // The texture belongs to the ground. With the engine supplying half the rumble it is half as deep,
+    // and standing still on the roughest field, engine running, there is none of it.
+    ForceSettings withEngine;
+    withEngine.engineRumble = 0.2;
+    withEngine.rumbleMax    = 1.0;
+    Telemetry loaded        = drivingOn(Surface::Tilled, 4.0, 1.0);
+    loaded.load             = 1.0;
+    ForceModel   probe(withEngine);
+    const double surfaceShare = (settle(probe, &loaded).rumble - withEngine.engineRumble) / probe.output().rumble;
+    CHECK(surfaceShare > 0.2 && surfaceShare < 0.8);
+    const Driven shared = drive(loaded, withEngine);
+    CHECK(near(1.0 - shared.lowestTexture, surfaceShare * (1.0 - tilled.lowestTexture), 0.02));
+    const Driven parked = drive(drivingOn(Surface::Tilled, 0.0, 1.0), withEngine);
+    CHECK(parked.last.rumble > 0.0 && parked.lowestTexture == 1.0 && parked.highestTexture == 1.0);
+
+    // However the time is cut up, the same ground has passed.
+    ForceModel fine;
+    ForceModel coarse;
+    const Telemetry field = drivingOn(Surface::Tilled, 4.0, 1.0);
+    for (int i = 0; i < 500; ++i)
+    {
+        fine.update(&field, 0.01);
+    }
+    for (int i = 0; i < 100; ++i)
+    {
+        coarse.update(&field, 0.05);
+    }
+    CHECK(near(fine.output().rumbleTexture, coarse.output().rumbleTexture, 1e-6));
+    CHECK(near(fine.output().rollKick, coarse.output().rollKick, 1e-3));
+
+    // Paused, the ground stops passing.
+    const double before = fine.output().rumbleTexture;
+    fine.update(nullptr, 0.05);
+    Telemetry onFoot = field;
+    onFoot.active    = false;
+    fine.update(&onFoot, 0.05);
+    fine.update(&field, 1e-9);
+    CHECK(near(fine.output().rumbleTexture, before, 1e-6));
+}
+
+void testBrokenGroundTugsAtTheWheel()
+{
+    const ForceSettings settings;
+    const double        lightness = settings.bumpKickMassHalf / (settings.bumpKickMassHalf + 8200.0);
+
+    // On a ploughed field the wheel is pulled now one way, now the other, within what the setting allows.
+    const Driven tilled = drive(drivingOn(Surface::Tilled, 4.0, 1.0), settings, 60.0);
+    const double limit  = settings.fieldTug * lightness;
+    CHECK(tilled.highestKick > 0.3 * limit && tilled.highestKick <= limit + 1e-9);
+    CHECK(tilled.lowestKick < -0.3 * limit && tilled.lowestKick >= -limit - 1e-9);
+
+    // A sown field gives a share of it; paved ground, gravel, grass and snow none.
+    const Driven sown = drive(drivingOn(Surface::Field, 4.0, 0.7), settings, 60.0);
+    CHECK(sown.highestKick > 0.0 && sown.highestKick <= 0.3 * limit + 1e-9);
+    for (const Surface smooth : {Surface::Road, Surface::Gravel, Surface::Grass, Surface::Snow})
+    {
+        const Driven none = drive(drivingOn(smooth, 4.0, 0.5));
+        CHECK(none.lowestKick == 0.0 && none.highestKick == 0.0);
+    }
+
+    // None at a standstill, none when switched off, and less for a heavier machine.
+    const Driven parked = drive(drivingOn(Surface::Tilled, 0.0, 1.0));
+    CHECK(parked.lowestKick == 0.0 && parked.highestKick == 0.0);
+    ForceSettings noTug;
+    noTug.fieldTug = 0.0;
+    const Driven without = drive(drivingOn(Surface::Tilled, 4.0, 1.0), noTug);
+    CHECK(without.lowestKick == 0.0 && without.highestKick == 0.0);
+    Telemetry heavy = drivingOn(Surface::Tilled, 4.0, 1.0);
+    heavy.mass      = 30000.0;
+    const Driven big = drive(heavy, settings, 60.0);
+    CHECK(big.highestKick < 0.5 * tilled.highestKick && big.highestKick > 0.0);
+
+    // It comes on top of a real bump's kick rather than replacing it.
+    Telemetry hit  = drivingOn(Surface::Tilled, 4.0, 1.0);
+    hit.bumpRight  = 1.0;
+    const Driven bumped = drive(hit, settings, 60.0);
+    CHECK(bumped.lowestKick >= settings.bumpKick * lightness - limit - 1e-9);
+    CHECK(bumped.highestKick <= settings.bumpKick * lightness + limit + 1e-9);
+    CHECK(bumped.highestKick > settings.bumpKick * lightness);
+}
+
+void testCrossingOntoNewGroundBlends()
+{
+    const ForceSettings settings;
+    const Telemetry     track = drivingOn(Surface::Gravel, 5.0, 0.3);
+    const Telemetry     field = drivingOn(Surface::Tilled, 5.0, 1.0);
+
+    ForceModel model;
+    CHECK(model.surface() == Surface::Unknown);
+    settle(model, &track, 5.0);
+    CHECK(model.surface() == Surface::Gravel);
+    const ForceOutput onTrack = model.output();
+
+    // One step onto the field changes very little: no jump in strength, pitch or texture.
+    const ForceOutput first = model.update(&field, 0.016);
+    CHECK(std::abs(first.rumble - onTrack.rumble) < 0.02);
+    CHECK(std::abs(first.rumbleHz - onTrack.rumbleHz) < 1.0);
+    CHECK(std::abs(first.rumbleTexture - onTrack.rumbleTexture) < 0.1);
+    CHECK(std::abs(first.rollKick) < 0.1 * settings.fieldTug);
+    CHECK(model.surface() == Surface::Gravel);
+
+    // The field has taken over within about a second, and after a few it is all there is.
+    double hzAfterOneSecond = 0.0;
+    for (int i = 0; i < 300; ++i)
+    {
+        const ForceOutput out = model.update(&field, 0.016);
+        if (i == 62)
+        {
+            hzAfterOneSecond = out.rumbleHz;
+            CHECK(model.surface() == Surface::Tilled);
+        }
+    }
+    const double settledHz = settled(field).rumbleHz;
+    CHECK(std::abs(hzAfterOneSecond - settledHz) < 0.15 * std::abs(onTrack.rumbleHz - settledHz));
+    CHECK(near(model.output().rumbleHz, settledHz, 0.05));
+
+    // Turning the patterns off mid-drive goes back to the plain rumble the same gentle way.
+    ForceSettings plain   = settings;
+    plain.surfacePatterns = false;
+    model.setSettings(plain);
+    const ForceOutput next = model.update(&field, 0.016);
+    CHECK(std::abs(next.rumbleHz - model.output().rumbleHz) < 1.0);
+    settle(model, &field, 5.0);
+    CHECK(model.surface() == Surface::Unknown);
+    CHECK(near(model.output().rumbleTexture, 1.0, 1e-6) && near(model.output().rollKick, 0.0, 1e-6));
+}
+
 void testEngineRumbleIsOptIn()
 {
     // Off by default, whatever the engine is doing.
@@ -765,6 +1056,492 @@ void testEngineRumbleIsOptIn()
     const ForceOutput both = settled(rolling, settings);
     CHECK(near(both.rumble, settings.rumbleSurface + 0.05, 1e-6));
     CHECK(both.rumbleHz > 15.0 && both.rumbleHz < settled(rolling).rumbleHz);
+}
+
+/** Feeds @p telemetry for @p seconds in 10 ms steps and returns the strongest rumble seen. */
+double peakRumble(ForceModel& model, const Telemetry& telemetry, double seconds)
+{
+    double peak = 0.0;
+    for (int i = 0; i < std::lround(seconds / 0.01); ++i)
+    {
+        peak = std::max(peak, model.update(&telemetry, 0.01).rumble);
+    }
+    return peak;
+}
+
+void testEngineStartShakes()
+{
+    ForceSettings settings;
+    settings.engineRumble = 0.10;
+
+    Telemetry off = driving(0.0);
+    off.rpm       = 0.0;
+    off.load      = 0.0;
+    Telemetry cranking = off;
+    cranking.starting  = true;
+    Telemetry idling   = off;
+    idling.rpm         = 850.0;
+
+    ForceModel model(settings);
+    CHECK(near(settle(model, &off).rumble, 0.0, 1e-6));
+
+    // While the start lasts, the shake holds at its own strength and its own slow frequency.
+    const ForceOutput started = settle(model, &cranking, 2.0);
+    CHECK(near(started.rumble, settings.engineStartShake, 1e-3));
+    CHECK(near(started.rumbleHz, settings.engineStartHz, 0.05));
+    CHECK(started.rumble > 3.0 * settings.engineRumble);
+
+    // Once the engine runs, the shake dies away to the ordinary idle rumble rather than cutting off.
+    const double justAfter = model.update(&idling, 0.01).rumble;
+    CHECK(justAfter > 0.5 * settings.engineStartShake);
+    const ForceOutput running = settle(model, &idling, 5.0);
+    CHECK(near(running.rumble, settings.engineRumble * settings.engineRumbleIdleShare, 1e-4));
+    CHECK(near(running.rumbleHz, 850.0 / 60.0, 0.05));
+
+    // It stands out even with running vibration switched off and the rumble limit turned right down.
+    ForceSettings quiet;
+    quiet.rumbleMax = 0.0;
+    ForceModel capped(quiet);
+    CHECK(near(settle(capped, &cranking, 2.0).rumble, quiet.engineStartShake, 1e-3));
+    CHECK(near(settle(capped, &idling, 5.0).rumble, 0.0, 1e-4));
+
+    // Turned off, a start is no different from an engine that is simply off.
+    ForceSettings none;
+    none.engineStartShake = 0.0;
+    ForceModel silent(none);
+    CHECK(near(peakRumble(silent, cranking, 2.0), 0.0, 1e-9));
+
+    // Leaving the vehicle mid-start drops it; it does not come back on re-entry.
+    ForceModel   left(settings);
+    Telemetry    onFoot;
+    onFoot.seq = 2;
+    settle(left, &cranking, 2.0);
+    settle(left, &onFoot, 3.0);
+    CHECK(near(peakRumble(left, off, 1.0), 0.0, 1e-6));
+
+    // Hostile values stay in range.
+    ForceSettings wild;
+    wild.engineStartShake       = 50.0;
+    wild.engineStartHz          = -3.0;
+    wild.engineStartFadeSeconds = -1.0;
+    ForceModel hostile(wild);
+    CHECK(withinRanges(settle(hostile, &cranking, 2.0), wild));
+    CHECK(withinRanges(settle(hostile, &idling, 1.0), wild));
+}
+
+void testElectricVehiclesHaveNoEngineVibration()
+{
+    ForceSettings settings;
+    settings.engineRumble = 0.30;
+
+    // Parked with the motor on: a diesel rumbles, an electric vehicle is still.
+    Telemetry diesel = driving(0.0);
+    diesel.rpm       = 900.0;
+    Telemetry electric = diesel;
+    electric.electric  = true;
+    CHECK(settled(diesel, settings).rumble > 0.1);
+    CHECK(near(settled(electric, settings).rumble, 0.0, 1e-6));
+
+    // A start flag on an electric vehicle, which the mod should never send, still shakes nothing.
+    Telemetry bogus = electric;
+    bogus.starting  = true;
+    ForceModel model(settings);
+    CHECK(near(peakRumble(model, bogus, 2.0), 0.0, 1e-9));
+
+    // Moving over rough ground it rumbles exactly as much as the ground alone gives a diesel.
+    ForceSettings groundOnly;
+    Telemetry     dieselOnField = driving(8.0);
+    dieselOnField.rough         = 1.0;
+    Telemetry electricOnField   = dieselOnField;
+    electricOnField.electric    = true;
+    const ForceOutput ground    = settled(dieselOnField, groundOnly);
+    const ForceOutput quietRide = settled(electricOnField, settings);
+    CHECK(ground.rumble > 0.1);
+    CHECK(near(quietRide.rumble, ground.rumble, 1e-6));
+    CHECK(near(quietRide.rumbleHz, ground.rumbleHz, 1e-6));
+    CHECK(settled(dieselOnField, settings).rumble > quietRide.rumble);
+
+    // Everything that is not vibration is the same for both.
+    const ForceOutput a = settled(dieselOnField, settings);
+    CHECK(near(a.rollSpring, quietRide.rollSpring) && near(a.rollDamper, quietRide.rollDamper) && near(a.rollForce, quietRide.rollForce));
+}
+
+void testAWheelHittingSomethingKicksTowardThatSide()
+{
+    // Mass scaling is checked separately below; here the kick is at its nominal strength.
+    ForceSettings settings;
+    settings.bumpKickMassHalf = 0.0;
+
+    Telemetry rightHit = driving(3.0);
+    rightHit.bumpRight = 1.0;
+    Telemetry leftHit = driving(3.0);
+    leftHit.bumpLeft  = 1.0;
+
+    // Positive is toward steering right, the same convention as the pull.
+    CHECK(near(settled(rightHit, settings).rollKick, settings.bumpKick, 1e-6));
+    CHECK(near(settled(leftHit, settings).rollKick, -settings.bumpKick, 1e-6));
+    CHECK(near(settled(driving(3.0), settings).rollKick, 0.0, 1e-9));
+
+    // Both wheels at once is a thump, not a yank: nothing sideways.
+    Telemetry both = rightHit;
+    both.bumpLeft  = 1.0;
+    CHECK(near(settled(both, settings).rollKick, 0.0, 1e-9));
+
+    // A half-strength hit kicks half as hard, and the kick leaves the steady pull alone.
+    Telemetry half = driving(3.0, 0.4);
+    half.bumpRight = 0.5;
+    CHECK(near(settled(half, settings).rollKick, 0.5 * settings.bumpKick, 1e-6));
+    CHECK(near(settled(half, settings).rollForce, settled(driving(3.0, 0.4), settings).rollForce, 1e-9));
+
+    // It is a jolt: nearly all of it arrives within 50 ms, and it is gone as fast when the bump ends.
+    ForceModel model(settings);
+    Telemetry  rolling = driving(3.0);
+    settle(model, &rolling);
+    for (int i = 0; i < 5; ++i)
+    {
+        model.update(&rightHit, 0.01);
+    }
+    CHECK(model.output().rollKick > 0.9 * settings.bumpKick);
+    for (int i = 0; i < 5; ++i)
+    {
+        model.update(&rolling, 0.01);
+    }
+    CHECK(model.output().rollKick < 0.1 * settings.bumpKick);
+
+    // It may exceed the cap on the steady pull, but not the device's range, whatever comes in.
+    ForceSettings strong = settings;
+    strong.bumpKick       = 1.0;
+    strong.rollForceLimit = 0.1;
+    CHECK(near(settled(rightHit, strong).rollKick, 1.0, 1e-6));
+    Telemetry garbage = driving(3.0);
+    garbage.bumpRight = 1e9;
+    garbage.bumpLeft  = std::nan("");
+    garbage.mass      = std::nan("");
+    const ForceOutput out = settled(garbage, strong);
+    CHECK(out.rollKick >= -1.0 && out.rollKick <= 1.0 && std::isfinite(out.rollKick));
+
+    // On foot or without telemetry there is nothing to kick.
+    Telemetry onFoot;
+    onFoot.seq       = 3;
+    onFoot.bumpRight = 1.0;
+    CHECK(near(settled(onFoot, settings).rollKick, 0.0, 1e-9));
+}
+
+void testBothWheelsTogetherShakeInsteadOfKicking()
+{
+    ForceSettings settings;
+    settings.bumpKickMassHalf = 0.0;
+
+    // Rail tracks met square on: both wheels, the same amount.
+    Telemetry tracks = driving(3.0);
+    tracks.bumpLeft  = 0.8;
+    tracks.bumpRight = 0.8;
+    const ForceOutput crossing = settled(tracks, settings);
+    CHECK(near(crossing.rollKick, 0.0, 1e-9));
+    CHECK(near(crossing.pitchThump, 0.8 * settings.bumpThump, 1e-6));
+    CHECK(near(crossing.rollWiggle, 0.8 * settings.bumpWiggle, 1e-6));
+    CHECK(near(crossing.bumpHz, settings.bumpShakeHz, 1e-9));
+
+    // A log under one wheel only is all kick and no shake.
+    Telemetry log  = driving(3.0);
+    log.bumpRight  = 0.8;
+    const ForceOutput oneSided = settled(log, settings);
+    CHECK(oneSided.rollKick > 0.0);
+    CHECK(near(oneSided.pitchThump, 0.0, 1e-9));
+    CHECK(near(oneSided.rollWiggle, 0.0, 1e-9));
+
+    // Tracks met at an angle: the shared part shakes, the difference kicks toward the harder hit.
+    Telemetry skewed = driving(3.0);
+    skewed.bumpLeft  = 0.3;
+    skewed.bumpRight = 0.9;
+    const ForceOutput angled = settled(skewed, settings);
+    CHECK(near(angled.pitchThump, 0.3 * settings.bumpThump, 1e-6));
+    CHECK(near(angled.rollKick, 0.6 * settings.bumpKick, 1e-6));
+
+    // The shakes are as quick as the kick, and nothing is left on smooth ground or on foot.
+    ForceModel model(settings);
+    Telemetry  rolling = driving(3.0);
+    settle(model, &rolling);
+    for (int i = 0; i < 5; ++i)
+    {
+        model.update(&tracks, 0.01);
+    }
+    CHECK(model.output().pitchThump > 0.9 * 0.8 * settings.bumpThump);
+    for (int i = 0; i < 5; ++i)
+    {
+        model.update(&rolling, 0.01);
+    }
+    CHECK(model.output().pitchThump < 0.1 * settings.bumpThump && model.output().rollWiggle < 0.1 * settings.bumpWiggle);
+    Telemetry onFoot;
+    onFoot.seq       = 4;
+    onFoot.bumpLeft  = 1.0;
+    onFoot.bumpRight = 1.0;
+    CHECK(near(settled(onFoot, settings).pitchThump, 0.0, 1e-9) && near(settled(onFoot, settings).rollWiggle, 0.0, 1e-9));
+
+    // The wiggle shrinks with mass like the kick; the thump is the whole cab moving and does not.
+    const ForceSettings scaled;
+    Telemetry           heavy = tracks;
+    heavy.mass                = 30000.0;
+    Telemetry light           = tracks;
+    light.mass                = 2500.0;
+    CHECK(settled(heavy, scaled).rollWiggle < 0.5 * settled(light, scaled).rollWiggle);
+    CHECK(near(settled(heavy, scaled).pitchThump, settled(light, scaled).pitchThump, 1e-9));
+
+    // Hostile settings and values stay in range.
+    ForceSettings wild;
+    wild.bumpThump   = 9.0;
+    wild.bumpWiggle  = -4.0;
+    wild.bumpShakeHz = 0.0;
+    Telemetry garbage = tracks;
+    garbage.bumpLeft  = 1e12;
+    garbage.bumpRight = 1e12;
+    const ForceOutput out = settled(garbage, wild);
+    CHECK(out.pitchThump >= 0.0 && out.pitchThump <= 1.0 && out.rollWiggle >= 0.0 && out.rollWiggle <= 1.0);
+    CHECK(out.bumpHz >= 2.0 && out.bumpHz <= 40.0);
+}
+
+void testTheKickShrinksAsTheMachineGetsHeavier()
+{
+    const ForceSettings settings;
+
+    const auto kickAt = [&](double mass) {
+        Telemetry telemetry = driving(3.0);
+        telemetry.mass      = mass;
+        telemetry.bumpRight = 1.0;
+        return settled(telemetry, settings).rollKick;
+    };
+
+    // Half at the configured mass, nearly all of it for something very light, little for a giant.
+    CHECK(near(kickAt(settings.bumpKickMassHalf), 0.5 * settings.bumpKick, 1e-6));
+    CHECK(kickAt(300.0) > 0.9 * settings.bumpKick);
+    CHECK(kickAt(40000.0) < 0.2 * settings.bumpKick);
+
+    // Strictly less with every step up in size: skid steer, small tractor, big tractor, with a loaded trailer.
+    double previous = settings.bumpKick + 1.0;
+    for (const double mass : {2500.0, 5000.0, 11000.0, 30000.0})
+    {
+        const double kick = kickAt(mass);
+        CHECK(kick > 0.0 && kick < previous);
+        previous = kick;
+    }
+
+    // Both directions scale alike.
+    Telemetry leftHit = driving(3.0);
+    leftHit.mass      = 11000.0;
+    leftHit.bumpLeft  = 1.0;
+    CHECK(near(settled(leftHit, settings).rollKick, -kickAt(11000.0), 1e-9));
+}
+
+/** Feeds the model a vehicle whose speed changes at @p accel m/s^2 for @p seconds, as the game would write it at 60 Hz. */
+ForceOutput accelerate(ForceModel& model, double fromSpeed, double accel, double seconds, std::uint64_t& seq, std::int64_t& timeMs)
+{
+    Telemetry telemetry = driving(fromSpeed);
+    for (int frame = 0; frame < std::lround(seconds * 60.0); ++frame)
+    {
+        telemetry.seq    = ++seq;
+        telemetry.timeMs = (timeMs += 17);
+        // Two decimals, as the mod writes it.
+        telemetry.speed = std::round((fromSpeed + accel * (frame + 1) * 0.017) * 100.0) / 100.0;
+        // The bridge updates faster than the game writes: the same sample is seen more than once.
+        model.update(&telemetry, 0.008);
+        model.update(&telemetry, 0.009);
+    }
+    return model.output();
+}
+
+void testPitchLeansWithAcceleration()
+{
+    const ForceSettings settings;
+    std::uint64_t       seq    = 100;
+    std::int64_t        timeMs = 50000;
+
+    // Steady speed: no lean, however fast.
+    ForceModel cruising(settings);
+    CHECK(std::abs(accelerate(cruising, 8.0, 0.0, 3.0, seq, timeMs).pitchTarget) < 0.005);
+    CHECK(std::abs(cruising.acceleration()) < 0.05);
+
+    // Pulling away at 1.5 m/s^2: the estimate finds it despite the coarse speed steps, and pitch leans in proportion.
+    ForceModel pulling(settings);
+    const ForceOutput away = accelerate(pulling, 0.0, 1.5, 3.0, seq, timeMs);
+    CHECK(near(pulling.acceleration(), 1.5, 0.15));
+    CHECK(near(away.pitchTarget, settings.accelSway * 1.5 / settings.accelSwayFullAccel, 0.01));
+    CHECK(away.pitchTarget > 0.0);
+
+    // Braking leans the other way, and no further than the full sway however hard.
+    ForceModel braking(settings);
+    accelerate(braking, 12.0, 0.0, 1.0, seq, timeMs);
+    const ForceOutput stop = accelerate(braking, 12.0, -8.0, 1.5, seq, timeMs);
+    CHECK(stop.pitchTarget < 0.0);
+    CHECK(stop.pitchTarget >= -settings.accelSway - 1e-9);
+    CHECK(near(stop.pitchTarget, -settings.accelSway, 0.01));
+
+    // Back at a steady speed it returns to center on its own.
+    CHECK(std::abs(accelerate(braking, 0.0, 0.0, 4.0, seq, timeMs).pitchTarget) < 0.005);
+
+    // It moves as a lean: never faster than its slew limit, even when the acceleration appears at once.
+    ForceModel sudden(settings);
+    accelerate(sudden, 5.0, 0.0, 1.0, seq, timeMs);
+    double    previous  = sudden.output().pitchTarget;
+    double    fastest   = 0.0;
+    Telemetry telemetry = driving(5.0);
+    for (int frame = 0; frame < 120; ++frame)
+    {
+        telemetry.seq    = ++seq;
+        telemetry.timeMs = (timeMs += 17);
+        telemetry.speed  = 5.0 + 6.0 * (frame + 1) * 0.017;
+        const double now = sudden.update(&telemetry, 0.017).pitchTarget;
+        fastest          = std::max(fastest, std::abs(now - previous) / 0.017);
+        previous         = now;
+    }
+    CHECK(fastest <= settings.swaySmoothing.perSecond + 1e-6);
+
+    // Switching to another vehicle is a jump in speed, not an acceleration: nothing leans.
+    ForceModel switching(settings);
+    accelerate(switching, 0.0, 0.0, 1.0, seq, timeMs);
+    Telemetry other = driving(15.0);
+    other.mass      = 3100.0;
+    double peak     = 0.0;
+    for (int frame = 0; frame < 120; ++frame)
+    {
+        other.seq    = ++seq;
+        other.timeMs = (timeMs += 17);
+        peak         = std::max(peak, std::abs(switching.update(&other, 0.017).pitchTarget));
+    }
+    CHECK(peak < 0.005);
+
+    // So is the game resuming after a pause, and leaving the vehicle clears it.
+    ForceModel paused(settings);
+    accelerate(paused, 2.0, 0.0, 1.0, seq, timeMs);
+    Telemetry resumed = driving(9.0);
+    resumed.seq       = ++seq;
+    resumed.timeMs    = (timeMs += 30000);
+    paused.update(&resumed, 0.017);
+    CHECK(std::abs(paused.acceleration()) < 1e-9);
+    Telemetry onFoot;
+    onFoot.seq = ++seq;
+    accelerate(pulling, 4.5, 1.5, 0.5, seq, timeMs);
+    settle(pulling, &onFoot, 3.0);
+    CHECK(std::abs(pulling.output().pitchTarget) < 1e-6 && pulling.acceleration() == 0.0);
+
+    // Off means off, and hostile numbers stay in range.
+    ForceSettings none;
+    none.accelSway = 0.0;
+    ForceModel off(none);
+    CHECK(std::abs(accelerate(off, 0.0, 2.0, 2.0, seq, timeMs).pitchTarget) < 1e-12);
+    ForceSettings wild;
+    wild.accelSway          = 40.0;
+    wild.accelSwayFullAccel = -1.0;
+    wild.accelFilterSeconds = -3.0;
+    ForceModel hostile(wild);
+    Telemetry  garbage = driving(1e9);
+    for (int frame = 0; frame < 60; ++frame)
+    {
+        garbage.seq    = ++seq;
+        garbage.timeMs = (timeMs += 17);
+        garbage.speed  = frame % 2 ? 1e9 : -1e9;
+        const double target = hostile.update(&garbage, 0.017).pitchTarget;
+        CHECK(std::isfinite(target) && target >= -1.0 && target <= 1.0);
+    }
+}
+
+/** A pitch axis with the AY210's character: it does not move until pushed harder than its friction. */
+struct StickyAxis
+{
+    double position = 0.0;
+    double speed    = 0.0;
+
+    void step(double push, double dt)
+    {
+        const double stiction = 0.37; // share of full force needed to break free, as measured
+        const double sliding  = 0.30;
+        if (std::abs(speed) < 1e-4 && std::abs(push) <= stiction)
+        {
+            speed = 0.0;
+            return;
+        }
+        const double drag  = (std::abs(speed) < 1e-4 ? (push > 0 ? 1.0 : -1.0) : (speed > 0 ? 1.0 : -1.0)) * sliding;
+        const double accel = 25.0 * (push - drag) - 10.0 * speed;
+        const double next  = speed + accel * dt;
+        // Friction stops the axis rather than reversing it.
+        speed = (speed != 0.0 && next * speed < 0.0) ? 0.0 : next;
+        position = std::clamp(position + speed * dt, -1.0, 1.0);
+    }
+};
+
+void testPitchServoMovesAStickyAxisWithoutHunting()
+{
+    const bridge::PitchServoSettings settings;
+    const double                     dt = 0.016;
+
+    bridge::PitchServo servo(settings);
+    StickyAxis         axis;
+
+    // Nothing to do at the target.
+    for (int i = 0; i < 100; ++i)
+    {
+        axis.step(servo.update(0.0, axis.position, dt), dt);
+    }
+    CHECK(axis.position == 0.0 && servo.push() == 0.0);
+
+    // A small lean: it gets there, stops within the deadband, and then leaves the axis alone.
+    double peakPush = 0.0;
+    double fastestChange = 0.0;
+    double previousPush  = 0.0;
+    for (int i = 0; i < 250; ++i)
+    {
+        const double push = servo.update(0.12, axis.position, dt);
+        peakPush          = std::max(peakPush, std::abs(push));
+        fastestChange     = std::max(fastestChange, std::abs(push - previousPush) / dt);
+        previousPush      = push;
+        axis.step(push, dt);
+    }
+    CHECK(std::abs(axis.position - 0.12) <= settings.deadband + 0.02);
+    CHECK(peakPush <= settings.maxPush + 1e-9);
+    CHECK(fastestChange <= settings.slewPerSecond + 1e-6);
+
+    int    reversals = 0;
+    double lastSign  = 0.0;
+    double moved     = 0.0;
+    double resting   = axis.position;
+    for (int i = 0; i < 250; ++i)
+    {
+        const double push = servo.update(0.12, axis.position, dt);
+        if (push != 0.0 && lastSign != 0.0 && (push > 0) != (lastSign > 0))
+        {
+            ++reversals;
+        }
+        lastSign = push != 0.0 ? push : lastSign;
+        axis.step(push, dt);
+        moved = std::max(moved, std::abs(axis.position - resting));
+    }
+    CHECK(reversals == 0);
+    CHECK(moved < 0.01);
+
+    // Back to center, and over to the other side.
+    for (int i = 0; i < 300; ++i)
+    {
+        axis.step(servo.update(0.0, axis.position, dt), dt);
+    }
+    CHECK(std::abs(axis.position) <= settings.deadband + 0.02);
+    for (int i = 0; i < 300; ++i)
+    {
+        axis.step(servo.update(-0.10, axis.position, dt), dt);
+    }
+    CHECK(std::abs(axis.position + 0.10) <= settings.deadband + 0.02);
+
+    // An axis that cannot move at all gets the maximum push and no more; reset lets go at once.
+    bridge::PitchServo blocked(settings);
+    for (int i = 0; i < 300; ++i)
+    {
+        blocked.update(0.3, 0.0, dt);
+    }
+    CHECK(near(blocked.push(), settings.maxPush, 1e-9));
+    blocked.reset();
+    CHECK(blocked.push() == 0.0);
+
+    // Nonsense in, nothing new out.
+    CHECK(servo.update(std::nan(""), 0.0, dt) == servo.push());
+    CHECK(servo.update(0.1, 0.0, 0.0) == servo.push());
 }
 
 void testPitchIsHeldRegardlessOfTelemetry()
@@ -1133,7 +1910,18 @@ int main()
     testRollForceSelfAligns();
     testRollForceAddsImplementDrag();
     testRumbleFollowsSurfaceAndSpeed();
+    testEachSurfaceHasItsOwnRumble();
+    testRoughGroundComesAndGoesUnderTheWheels();
+    testBrokenGroundTugsAtTheWheel();
+    testCrossingOntoNewGroundBlends();
     testEngineRumbleIsOptIn();
+    testEngineStartShakes();
+    testElectricVehiclesHaveNoEngineVibration();
+    testAWheelHittingSomethingKicksTowardThatSide();
+    testTheKickShrinksAsTheMachineGetsHeavier();
+    testBothWheelsTogetherShakeInsteadOfKicking();
+    testPitchLeansWithAcceleration();
+    testPitchServoMovesAStickyAxisWithoutHunting();
     testPitchIsHeldRegardlessOfTelemetry();
     testFadesToIdle();
     testTargetIsWhereTheOutputsSettle();

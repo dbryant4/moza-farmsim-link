@@ -2,6 +2,8 @@
 
 #include "telemetry.hpp"
 
+#include <array>
+
 namespace bridge {
 
 /** Normalized force settings for the device layer; 1.0 is 100% of the matching effect. */
@@ -14,6 +16,12 @@ struct ForceOutput
     double pitchDamper = 0.0; // 0..1
     double rumble      = 0.0; // 0..1 vibration strength
     double rumbleHz    = 0.0; // vibration frequency
+    double rumbleTexture = 1.0; // 0..1 what the rumble is multiplied by right now: the surface's grain passing under the wheels
+    double rollKick    = 0.0; // -1..1 brief extra force on roll, added to rollForce; same sign convention
+    double pitchThump  = 0.0; // 0..1 brief in-out shake on pitch
+    double rollWiggle  = 0.0; // 0..1 brief left-right shake on roll
+    double bumpHz      = 0.0; // frequency of the thump and the wiggle
+    double pitchTarget = 0.0; // -1..1 where pitch should sit, in half-travels from center; positive while gaining speed
 };
 
 /** How one output is eased toward its target. */
@@ -71,6 +79,29 @@ struct ForceSettings
     /** Cap on the constant force as a whole, 0..1, whatever the terms above add up to. */
     double rollForceLimit = 0.30;
 
+    // Kick: a front wheel hitting a log or a kerb is held back for an instant, which yanks the
+    // steering toward the side that hit. Not subject to rollForceLimit; it is meant to be a jolt.
+
+    /** Kick when one steered wheel of a very light machine takes a full hit (bump = 1) and the other none, 0..1. */
+    double bumpKick = 0.5;
+    /**
+     * Total mass at which the kick is down to half, kg. A log that throws a skid steer's wheel
+     * sideways barely moves a 20 t tractor's, so the kick shrinks as the rig gets heavier. 0 turns
+     * the scaling off.
+     */
+    double bumpKickMassHalf = 6000.0;
+
+    // Both steered wheels jolted together, as when crossing rail tracks or meeting a kerb head on.
+    // There is no side to kick toward, so the wheel shakes instead: in and out, and a little left
+    // and right. Each lasts as long as the bump does.
+
+    /** In-out shake on pitch at a full hit on both wheels, 0..1. Pitch needs a lot before it moves. */
+    double bumpThump = 0.7;
+    /** Left-right shake on roll for the same hit on a very light machine, 0..1. Shrinks with mass like the kick. */
+    double bumpWiggle = 0.25;
+    /** Frequency of both shakes, Hz. Low: these are a couple of lurches, not a buzz. */
+    double bumpShakeHz = 7.0;
+
     // Rumble.
 
     /** Strength on the roughest surface (rough = 1) at and above rumbleFullSpeed, 0..1. */
@@ -94,6 +125,40 @@ struct ForceSettings
     double engineRumble = 0.0;
     /** Fraction of engineRumble left at zero engine load, 0..1. */
     double engineRumbleIdleShare = 0.5;
+    /**
+     * Shake while a combustion engine is being started, 0..1: the starter cranking and the engine
+     * catching. It comes on top of rumbleMax rather than under it, because the point of it is to
+     * stand out from the running rumble. Electric vehicles get none.
+     */
+    double engineStartShake = 0.6;
+    /** Frequency of the start-up shake, Hz, held inside the rumble band. Cranking is slow and lumpy. */
+    double engineStartHz = 9.0;
+    /** How long the start-up shake takes to die away once the engine is running, seconds. */
+    double engineStartFadeSeconds = 0.8;
+
+    // Surfaces. Each kind of ground has its own pattern of rumble (see kPatterns in
+    // force_model.cpp): where in the frequency band it sits, how lumpy it is, whether it pulses
+    // as ridges pass. These set how much of each there is; the pattern itself is fixed.
+
+    /** Off gives every surface the same plain rumble, scaled by its roughness only. */
+    bool surfacePatterns = true;
+    /** Strength per surface, as a multiple of what its roughness alone would give. */
+    double surfaceRoad   = 0.0; // paved ground is smooth; raising this gives it a faint, fast buzz
+    double surfaceGravel = 1.0;
+    double surfaceGrass  = 0.7;
+    double surfaceSnow   = 0.6;
+    double surfaceHeap   = 1.0;
+    double surfaceField  = 1.0;
+    double surfaceTilled = 1.0;
+    double surfaceRidge  = 1.0;
+    /**
+     * Irregular pull on the steering from broken ground, 0..1 of full force for a very light
+     * machine on a ploughed field at speed; other surfaces get a share of it or none. Shrinks with
+     * mass like the kick.
+     */
+    double fieldTug = 0.12;
+    /** How long the feel takes to change when the ground under the wheels does, seconds. */
+    double surfaceBlendSeconds = 0.25;
 
     // Pitch is not a control in the game; it is only held centered so it does not flop in and out.
 
@@ -101,6 +166,15 @@ struct ForceSettings
     double pitchSpring = 0.80;
     /** Pitch damping while driving, 0..1. */
     double pitchDamper = 0.30;
+
+    // Sway: the yoke leans a little in and out with acceleration and braking.
+
+    /** How far pitch moves from center at accelSwayFullAccel, in half-travels, 0..1. 0 turns it off. */
+    double accelSway = 0.12;
+    /** Acceleration that gives the full sway, m/s^2. A tractor pulling away manages 1 to 2; hard braking more. */
+    double accelSwayFullAccel = 2.5;
+    /** Time constant of the acceleration estimate, seconds. Speed arrives in 0.01 m/s steps and needs it. */
+    double accelFilterSeconds = 0.20;
 
     // Idle: no fresh telemetry, or the player is not in a vehicle. Applies to both axes.
 
@@ -119,6 +193,10 @@ struct ForceSettings
     Smoothing rumbleSmoothing{0.15, 2.0};
     /** perSecond is in Hz per second here. */
     Smoothing rumbleHzSmoothing{0.25, 40.0};
+    /** Barely smoothed: the mod already shapes each bump, and a softened jolt is not a jolt. */
+    Smoothing kickSmoothing{0.015, 60.0};
+    /** perSecond is in half-travels per second here. Slow: a lean, not a shove. */
+    Smoothing swaySmoothing{0.20, 0.8};
     /**
      * Longest time one update advances the smoothing by, seconds. After a stall the model resumes
      * from where it was at this pace, instead of covering the whole gap in one jump. 0 removes the cap.
@@ -130,6 +208,8 @@ struct ForceSettings
  * Turns telemetry into force settings: what a tractor's steering would feel like, as far as a
  * spring, a damper, a constant force and a vibration can say it. Pure arithmetic with no device
  * access. Every output moves continuously, including from construction, when all are zero.
+ * Besides its outputs it remembers only an engine start in progress, the last speed sample, from
+ * which it estimates acceleration, and how far along the ground's texture the wheels are.
  */
 class ForceModel
 {
@@ -154,14 +234,41 @@ public:
 
     const ForceSettings& settings() const { return m_settings; }
 
+    /** The vehicle's forward acceleration as estimated from its speed telemetry, m/s^2. */
+    double acceleration() const { return m_acceleration; }
+
+    /** The surface whose pattern currently dominates the rumble. */
+    Surface surface() const;
+
     /** Swaps the tuning while running. Outputs carry on from where they are and ease toward the new targets. */
     void setSettings(const ForceSettings& settings) { m_settings = settings; }
 
 private:
     ForceOutput clamped(ForceOutput output) const;
+    void        trackEngineStart(const Telemetry* telemetry, double dt);
+    void        trackAcceleration(const Telemetry* telemetry, double dt);
+    void        trackSurface(const Telemetry* telemetry, double dt);
 
     ForceSettings m_settings;
     ForceOutput   m_output;
+    /** 1 while the engine is being started, then falling to 0 over engineStartFadeSeconds. */
+    double m_startShake = 0.0;
+
+    // The last telemetry sample the acceleration estimate was advanced with.
+    bool          m_haveSpeed    = false;
+    std::uint64_t m_speedSeq     = 0;
+    std::int64_t  m_speedTimeMs  = 0;
+    double        m_speed        = 0.0;
+    double        m_speedMass    = 0.0;
+    double        m_sinceSpeed   = 0.0;
+    double        m_acceleration = 0.0;
+
+    /** How much of each surface's pattern is in the mix; sums to 1. Crossing onto new ground shifts it over a moment. */
+    std::array<double, kSurfaceCount> m_surfaceMix{1.0};
+    // How far the wheels have come through the ground's texture, in lumps, ridges and tugs.
+    double m_grainPhase = 0.0;
+    double m_pulsePhase = 0.0;
+    double m_tugPhase   = 0.0;
 };
 
 } // namespace bridge

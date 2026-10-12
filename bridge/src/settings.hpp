@@ -128,6 +128,31 @@ public:
      */
     bool save(const std::filesystem::path& path, std::string* error = nullptr);
 
+    /**
+     * What save() writes, as text: every setting at its current value, saved or not. A file with
+     * this content can be handed to importText() on another machine, or used as the settings file.
+     */
+    std::string exportText() const;
+
+    struct ImportResult
+    {
+        /** Settings the text gave a usable value for. 0 means it was not a settings file, and nothing was touched. */
+        int applied = 0;
+        /** How many of those now differ from what they were. */
+        int changed = 0;
+        /** One line per skipped or adjusted entry, as for load(). */
+        std::vector<std::string> warnings;
+    };
+
+    /**
+     * Applies each `key = value` line of @p text, in the form exportText() writes. Unlike load(),
+     * a setting the text does not mention keeps its current value, so a file from an older
+     * version leaves newer settings alone. Unknown keys and unreadable values are skipped and
+     * out-of-range values clamped, each with a warning. Nothing is written to disk: the imported
+     * values are unsaved changes until save().
+     */
+    ImportResult importText(std::string_view text);
+
 private:
     struct Entry
     {
@@ -137,6 +162,14 @@ private:
     };
 
     bool          add(SettingInfo info);
+    /** The settings file's content for @p states. */
+    static std::string settingsText(const std::vector<SettingState>& states);
+    /**
+     * Reads `key = value` lines into @p values (one slot per entry, in order), noting in @p given
+     * which slots a line supplied. Needs m_mutex held.
+     */
+    void readLines(const std::vector<std::string_view>& lines, std::vector<double>& values, std::vector<bool>& given,
+                   std::vector<std::string>& warnings) const;
     const Entry*  find(std::string_view key) const;
     static double clamped(const SettingInfo& info, double value);
 

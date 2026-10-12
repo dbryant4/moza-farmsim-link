@@ -31,7 +31,7 @@ MozaYokeLink = {}
 MozaYokeLink.suppressGameForceFeedback = true
 
 -- Keep in step with <version> in modDesc.xml (the tests check this).
-MozaYokeLink.VERSION = "0.1.1.0"
+MozaYokeLink.VERSION = "0.1.2.0"
 
 -- Fixed by the telemetry contract; deliberately not derived from the mod's
 -- file name.
@@ -61,6 +61,7 @@ Y.retryInMs = 0
 Y.loggedErrors = 0
 Y.loggedMessages = {}
 Y.lastVehicle = nil
+Y.lastField = nil
 Y.devicesLogged = false
 Y.throttle = nil
 Y.enabled = false
@@ -644,7 +645,7 @@ local function vehicleName(vehicle)
     return tostring(name or vehicle.typeName or "?")
 end
 
-local SOURCE_ORDER = { "speed", "steer", "mass", "engine", "slip", "surface", "implements" }
+local SOURCE_ORDER = { "speed", "steer", "mass", "engine", "rpmrange", "starting", "electric", "slip", "surface", "implements", "bumps" }
 
 function Y.logVehicle(vehicle, vehicleSource, sample, info)
     local parts = {}
@@ -674,6 +675,9 @@ function Y:loadMap(name)
         Y.loggedTransitions = 0
         Y.unchangedReads = 0
         Y.unusableReads = 0
+        MozaTelemetry.resetVehicleCache()
+        MozaTelemetry.resetBumpNotes()
+        Y.lastField = nil
         Y.lastClockSec = nil
         Y.presence = MozaTelemetry.newPresence()
         Y.bridgePath, Y.bridgeReader, Y.bridgeReaderName = nil, nil, nil
@@ -717,6 +721,7 @@ function Y:deleteMap()
         Y.removeForceFeedbackOverride()
         Y.enabled = false
         Y.lastVehicle = nil
+        MozaTelemetry.resetVehicleCache()
     end)
     if not ok then
         Y.logProblem("deleteMap: " .. tostring(err))
@@ -756,6 +761,16 @@ function Y.onUpdate(dt)
 
     if vehicle ~= nil then
         Y.clearVehicleForceFeedback(vehicle)
+
+        -- Bumps are single events: they are looked for on every frame, not
+        -- only on the frames that write. The few notes this returns are for
+        -- calibrating the thresholds from the game log.
+        local okBump, note = pcall(MozaTelemetry.updateBumps, vehicle, dt, Y.lastField)
+        if not okBump then
+            Y.logProblem("bumps: " .. tostring(note))
+        elseif note ~= nil then
+            Y.log(note)
+        end
     end
 
     if Y.throttle == nil then
@@ -776,6 +791,7 @@ function Y.onUpdate(dt)
     end
 
     local sample, info = MozaTelemetry.gather(vehicle)
+    Y.lastField = sample.field
 
     if isNewVehicle then
         Y.lastVehicle = vehicle

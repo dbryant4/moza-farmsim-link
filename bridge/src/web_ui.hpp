@@ -25,6 +25,9 @@ namespace bridge {
  *   POST /api/save     Writes the settings file.
  *   POST /api/revert   Reloads the settings file, discarding unsaved changes.
  *   POST /api/reset    Puts every setting back to its default (not saved until /api/save).
+ *   GET  /api/export   The current values as a settings file (text/plain, sent as a download).
+ *   POST /api/import   Body: a settings file as /api/export gives. Applies the values it holds and
+ *                      leaves the rest alone (not saved until /api/save). 400 if it holds none.
  *   POST /api/forces   Body: `on` or `off`. Sets StatusBoard::setForcesEnabled().
  *   POST /api/release  Panic button: StatusBoard::requestRelease(), and forces enabled goes off
  *                      so nothing is re-applied until the user switches forces back on.
@@ -33,7 +36,7 @@ namespace bridge {
  *   "result": {"message": "Saved to moza_fs_bridge.ini", "warnings": []}
  * Every failure answers with a one-line text/plain reason: 400 malformed request or body,
  * 403 wrong Host or Origin, 404 unknown path, 405 wrong method (with Allow), 408 request not
- * finished within two seconds, 411 chunked body, 413 body over 16 KiB, 431 header over 8 KiB,
+ * finished within two seconds, 411 chunked body, 413 body over 64 KiB, 431 header over 8 KiB,
  * 500 settings file could not be written or read.
  *
  * The state document:

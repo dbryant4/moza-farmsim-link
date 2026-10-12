@@ -6,6 +6,8 @@
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
+#include <string>
 
 namespace bridge {
 
@@ -18,6 +20,8 @@ struct LinkTuning
     bool flipPull = false;
     /** Rumble goes to pitch by default: roll is light enough that shaking it would steer the vehicle. */
     bool rumbleOnRoll = false;
+    /** Reverses which way the yoke leans under acceleration. */
+    bool flipSway = false;
     /** Raw value that 100% maps to. */
     int fullScale = 32767;
 };
@@ -34,11 +38,57 @@ struct DeviceForces
     std::int16_t  rumble         = 0;
     std::uint32_t rumblePeriodMs = 100;
     Axis          rumbleAxis     = Axis::Pitch;
+    /** Sine on pitch and sine on roll for a bump taken by both wheels, sharing one period. */
+    std::int16_t  thump        = 0;
+    std::int16_t  wiggle       = 0;
+    std::uint32_t bumpPeriodMs = 140;
+    /** Where the pitch spring is centered, so that it holds the sway instead of fighting it. */
+    std::int16_t pitchCenter = 0;
+    /** Constant-force magnitude on pitch that moves the yoke there, in the base's sign convention. */
+    std::int16_t pitchPush = 0;
 
     bool operator==(const DeviceForces&) const = default;
 };
 
-DeviceForces toDeviceForces(const ForceOutput& output, const LinkTuning& tuning);
+/** Where pitch should sit for @p output, in half-travels from center; positive is a higher reported position. */
+double pitchTargetFor(const ForceOutput& output, const LinkTuning& tuning);
+
+/**
+ * @p pitchPush is what the pitch position controller asks for, -1..1, positive toward higher
+ * positions; it cannot come from @p output because it depends on where the yoke is.
+ */
+DeviceForces toDeviceForces(const ForceOutput& output, const LinkTuning& tuning, double pitchPush = 0.0);
+
+/** How the yoke handle's lights follow the engine. Brightness is in the handle's own steps, 0..15. */
+struct LightTuning
+{
+    bool   followEngine = false;
+    /** Brightness with the engine idling. */
+    double low = 3.0;
+    /** Idle and full engine speed, 1/min, for a vehicle whose own range the game does not report. */
+    double idleRpm = 900.0;
+    double fullRpm = 2200.0;
+    /** Whether the colour moves toward red near the top of the engine's range. */
+    bool colorShift = true;
+    /** Share of the range between idle and full speed at which the colour starts to change, 0..1. */
+    double colorFrom = 0.6;
+};
+
+/** What the yoke's lights should show at one moment. */
+struct LightTarget
+{
+    /** Brightness 0..15; negative means "as the user had them". */
+    double level = -1.0;
+    /** 0 is the user's own colour, 1 fully shifted to the high-revs colour. */
+    double heat = 0.0;
+};
+
+/**
+ * What the yoke's lights should show for @p telemetry: dark with the engine off, `low` at idle
+ * rising to full at the top of this vehicle's own engine speed range, with the colour shifting
+ * over the last part of it. With the feature off or nobody driving, the lights are left as found.
+ */
+LightTarget lightTargetFor(const Telemetry* telemetry, const LightTuning& tuning);
 
 struct LinkOptions
 {
@@ -50,6 +100,19 @@ struct LinkOptions
     /** Stop after this long; 0 runs until @p stop is set. */
     double seconds = 0.0;
     bool   verbose = false;
+
+    /**
+     * Called once the link is up, with the settings page's port (0 if there is no page), and then
+     * about once a second with a one-line state for display. With onStatus set, the once-a-second
+     * console line is not printed; changes of state are, so that a log file stays small.
+     */
+    std::function<void(int uiPort)>              onStarted;
+    std::function<void(const std::string& text)> onStatus;
+
+    /** If set, kept equal to the "check for new versions" setting, from before onStarted is called. */
+    std::atomic<bool>* checkForUpdates = nullptr;
+    /** If set, shown on the settings page as the program's version and asked for again about once a second. */
+    std::function<std::string()> versionText;
 };
 
 /**

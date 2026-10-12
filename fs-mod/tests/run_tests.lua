@@ -68,13 +68,13 @@ end
 -- contract checker: asserts a line follows docs/telemetry.md
 ---------------------------------------------------------------------------
 
-local INT_KEYS = { seq = true, t = true, mass = true, rpm = true }
-local FLAG_KEYS = { active = true, field = true, lowered = true, working = true, ["end"] = true }
+local INT_KEYS = { seq = true, t = true, mass = true, rpm = true, rpmmin = true, rpmmax = true, surface = true }
+local FLAG_KEYS = { active = true, field = true, lowered = true, working = true, starting = true, electric = true, ["end"] = true }
 local RANGES = {
-    steer = { -1, 1 }, load = { 0, 1 }, slip = { 0, 1 }, rough = { 0, 1 },
-    speed = { -200, 200 },
+    steer = { -1, 1 }, load = { 0, 1 }, slip = { 0, 1 }, rough = { 0, 1 }, bumpl = { 0, 1 }, bumpr = { 0, 1 },
+    speed = { -200, 200 }, surface = { 1, 8 },
 }
-local KNOWN_ORDER = { "seq", "t", "active", "speed", "steer", "mass", "rpm", "load", "slip", "rough", "field", "lowered", "working", "end" }
+local KNOWN_ORDER = { "seq", "t", "active", "speed", "steer", "mass", "rpm", "load", "rpmmin", "rpmmax", "slip", "rough", "surface", "field", "lowered", "working", "starting", "electric", "bumpl", "bumpr", "end" }
 
 --- @return table of key -> text value
 local function checkLine(line)
@@ -148,17 +148,32 @@ local function resetGameGlobals()
     g_currentMission = { time = 913400, paused = false, hud = {} }
     g_localPlayer = nil
     g_time = nil
+    g_fillTypeManager = nil
+    localToLocal, getWheelShapeContactForce = nil, nil
+    -- the values are arbitrary; only the names are the game's
+    MotorState = { OFF = 11, IGNITION = 12, STARTING = 13, ON = 14 }
     slipByShape = {}
     getWheelShapeSlip = function(node, shape)
         return slipByShape[shape] or 0, 0
     end
 end
 
+--- Wheels 1 and 2 are the steered front pair (left, right), 3 and 4 the rear pair.
 local function newWheel(shape, opts)
     opts = opts or {}
+    local front, left = shape <= 2, shape % 2 == 1
     return {
         node = 1000 + shape,
+        isLeft = left,
         physics = {
+            -- +x is the vehicle's left, +z its front
+            positionX = left and 0.95 or -0.95,
+            positionZ = front and 1.45 or -1.25,
+            rotMax = front and 0.61 or 0,
+            rotMin = front and -0.61 or 0,
+            rotSpeed = front and 1 or 0,
+            load = front and 1.8 or 2.4, -- tonnes on the tire
+            getTireLoad = function(self) return self.load end,
             wheelShape = shape,
             wheelShapeCreated = true,
             hasGroundContact = opts.hasGroundContact ~= false,
@@ -167,7 +182,7 @@ local function newWheel(shape, opts)
             groundDepth = opts.groundDepth or 0,
             hasSnowContact = opts.hasSnowContact or false,
             radius = opts.radius or 0.8,
-            netInfo = { xDriveSpeed = opts.xDriveSpeed or (5.42 / 0.8), slip = opts.netSlip or 0 },
+            netInfo = { xDriveSpeed = opts.xDriveSpeed or (5.42 / 0.8), slip = opts.netSlip or 0, suspensionLength = 0.1 },
         },
     }
 end
@@ -197,7 +212,6 @@ local function newTractor()
         maxRotTime = 0.6,
         minRotTime = -0.8,
         rotatedTime = 0.15, -- a quarter of maxRotTime: left
-        motorStarted = true,
         spec_drivable = { axisSide = -0.25, steeringDirection = 1, forceFeedback = { isActive = false, axisIndex = 0, intensity = 1 } },
         spec_motorized = {
             motor = {
@@ -205,8 +219,20 @@ local function newTractor()
                 getLastModulatedMotorRpm = function(self) return self.rpm end,
                 getLastMotorRpm = function(self) return self.rpm end,
                 getSmoothLoadPercentage = function() return 0.62 end,
+                minRpm = 850,
+                maxRpm = 2200,
+                getMinRpm = function(self) return self.minRpm end,
+                getMaxRpm = function(self) return self.maxRpm end,
             },
             smoothedLoadPercentage = 0.62,
+            motorState = MotorState.ON,
+            motorStartTime = 0,
+            -- a diesel tractor with exhaust fluid and air brakes
+            consumersByFillTypeName = {
+                DIESEL = { fillUnitIndex = 1, fillType = 32 },
+                DEF = { fillUnitIndex = 2, fillType = 33 },
+                AIR = { fillUnitIndex = 3, fillType = 34 },
+            },
             differentials = {
                 { diffIndex1 = 1, diffIndex1IsWheel = true, diffIndex2 = 2, diffIndex2IsWheel = true },
                 { diffIndex1 = 3, diffIndex1IsWheel = true, diffIndex2 = 4, diffIndex2IsWheel = true },
@@ -225,7 +251,8 @@ local function newTractor()
     function v:getLastSpeed() return math.abs(self.lastSpeed) * 3600 end
     function v:getMotorRpmReal() return self.spec_motorized.motor:getLastModulatedMotorRpm() end
     function v:getMotorLoadPercentage() return self.spec_motorized.smoothedLoadPercentage end
-    function v:getIsMotorStarted() return self.motorStarted end
+    function v:getMotorState() return self.spec_motorized.motorState end
+    function v:getIsMotorStarted() return self.spec_motorized.motorState == MotorState.ON end
     function v:getMotor() return self.spec_motorized.motor end
     function v:getIsLowered(default) return false end
     function v:getIsOnField() return true end
@@ -384,7 +411,16 @@ test("fmtFixed and fmtInt produce plain decimals", function()
     eq(T.fmtInt(nil), nil, "nil")
 end)
 
+-- The example line in docs/telemetry.md, and the same line with the two keys
+-- added after it was written. A real vehicle always has both, so the line a
+-- tractor produces is the second one; the doc may show either.
 local contractExample = "MOZAFS 1 seq=4821 t=913400 active=1 speed=5.42 steer=-0.250 mass=8200 rpm=1450 load=0.62 slip=0.04 rough=0.70 field=1 lowered=1 working=1 end=1"
+local driveExample = contractExample:gsub(" end=1$", " starting=0 electric=0 end=1")
+local bumpExample = contractExample:gsub(" end=1$", " starting=0 electric=0 bumpl=0.00 bumpr=0.00 end=1")
+-- ... and with the engine's idle and maximum speed after load: what the mocked tractor produces now
+local rangeExample = bumpExample:gsub(" load=0%.62 ", " load=0.62 rpmmin=850 rpmmax=2200 ")
+-- ... and with the kind of surface after rough
+local fullExample = rangeExample:gsub(" rough=0%.70 ", " rough=0.70 surface=6 ")
 
 test("the example in docs/telemetry.md is the one tested here", function()
     local doc = readFile(contractFile)
@@ -392,16 +428,67 @@ test("the example in docs/telemetry.md is the one tested here", function()
         realPrint("        (docs/telemetry.md not found, using the embedded copy)")
         return
     end
-    check(doc:find(contractExample, 1, true), "docs/telemetry.md no longer contains the example line this test expects")
+    check(doc:find(contractExample, 1, true) or doc:find(driveExample, 1, true) or doc:find(bumpExample, 1, true)
+        or doc:find(rangeExample, 1, true) or doc:find(fullExample, 1, true),
+        "docs/telemetry.md no longer contains the example line this test expects")
+    for _, key in ipairs({ "starting", "electric", "bumpl", "bumpr", "rpmmin", "rpmmax", "surface" }) do
+        check(doc:find("| `" .. key .. "` |", 1, true), "the key table lists " .. key)
+    end
 end)
 
 test("formatLine reproduces the contract example byte for byte", function()
-    local line = T.formatLine(4821, 913400, {
+    local sample = {
         active = true, speed = 5.42, steer = -0.25, mass = 8200, rpm = 1450, load = 0.62,
         slip = 0.04, rough = 0.7, field = true, lowered = true, working = true,
-    })
+    }
+    local line = T.formatLine(4821, 913400, sample)
     eq(line, contractExample .. "\n")
     checkLine(line)
+
+    -- with the two later keys: after working, before end=1
+    sample.starting, sample.electric = false, false
+    line = T.formatLine(4821, 913400, sample)
+    eq(line, driveExample .. "\n")
+    checkLine(line)
+    sample.starting, sample.electric = true, false
+    eq(T.formatLine(4821, 913400, sample), (driveExample:gsub("starting=0", "starting=1")) .. "\n")
+
+    -- and with the bump keys: last before end=1, two decimals like the other fractions
+    sample.starting, sample.bumpl, sample.bumpr = false, 0, 0
+    line = T.formatLine(4821, 913400, sample)
+    eq(line, bumpExample .. "\n")
+    checkLine(line)
+
+    -- and with the engine's idle and maximum speed: whole numbers, right after load
+    sample.rpmmin, sample.rpmmax = 850, 2200
+    line = T.formatLine(4821, 913400, sample)
+    eq(line, rangeExample .. "\n")
+    checkLine(line)
+
+    -- and with the kind of surface: a whole number, right after rough
+    sample.surface = 6
+    line = T.formatLine(4821, 913400, sample)
+    eq(line, fullExample .. "\n")
+    eq(line, "MOZAFS 1 seq=4821 t=913400 active=1 speed=5.42 steer=-0.250 mass=8200 rpm=1450 load=0.62 rpmmin=850 rpmmax=2200 slip=0.04 rough=0.70 surface=6 field=1 lowered=1 working=1 starting=0 electric=0 bumpl=0.00 bumpr=0.00 end=1\n")
+    checkLine(line)
+    -- a kind outside the contract's list is left out rather than sent as something it is not
+    for _, odd in ipairs({ 0, 9, -1, 1 / 0 }) do
+        sample.surface = odd
+        eq(T.formatLine(4821, 913400, sample), rangeExample .. "\n", "surface " .. tostring(odd))
+    end
+    sample.surface = nil
+    sample.rpmmin, sample.rpmmax = 849.6, 2200.4
+    local range = checkLine(T.formatLine(4821, 913400, sample))
+    eq(range.rpmmin, "850") eq(range.rpmmax, "2200")
+    sample.rpmmin, sample.rpmmax = nil, nil
+    sample.bumpl, sample.bumpr = 0.304, 7
+    local v = checkLine(T.formatLine(4821, 913400, sample))
+    eq(v.bumpl, "0.30") eq(v.bumpr, "1.00", "clamped")
+    sample.bumpl, sample.bumpr = -0.2, 0 / 0
+    v = checkLine(T.formatLine(4821, 913400, sample))
+    eq(v.bumpl, "0.00") eq(v.bumpr, nil, "NaN is left out")
+    sample.starting, sample.electric, sample.bumpl, sample.bumpr = nil, true, nil, nil
+    eq(T.formatLine(4821, 913400, sample), (contractExample:gsub(" end=1$", " electric=1 end=1")) .. "\n", "each key is left out on its own")
 end)
 
 test("not driving: active=0 and nothing else", function()
@@ -435,8 +522,12 @@ test("tractor + lowered, working cultivator reproduces the contract example", fu
     local sample, info = T.gather(tractor)
     local line = T.formatLine(4821, g_currentMission.time, sample)
     checkLine(line)
-    eq(line, contractExample .. "\n")
+    eq(line, fullExample .. "\n")
     check(next(info.errors) == nil, "unexpected gather errors")
+    eq(info.sources.starting, "getMotorState")
+    eq(info.sources.electric, "consumersByFillTypeName (AIR,DEF,DIESEL)")
+    eq(info.sources.bumps, "tire load against its running average of the steered wheels (1 left, 1 right)")
+    eq(info.sources.rpmrange, "motor:getMinRpm/getMaxRpm (850..2200)")
     eq(info.sources.speed, "lastSignedSpeed")
     eq(info.sources.steer, "rotatedTime")
     check(info.sources.slip:find("getWheelShapeSlip", 1, true), "slip source: " .. tostring(info.sources.slip))
@@ -528,11 +619,11 @@ test("engine rpm and load, zero when the engine is off", function()
     local _, v = lineFor(tractor)
     eq(v.rpm, "1450") eq(v.load, "0.62")
 
-    tractor.motorStarted = false
+    tractor.spec_motorized.motorState = MotorState.OFF
     _, v = lineFor(tractor)
     eq(v.rpm, "0") eq(v.load, "0.00")
 
-    tractor.motorStarted = true
+    tractor.spec_motorized.motorState = MotorState.ON
     tractor.getMotorRpmReal = nil
     tractor.getMotorLoadPercentage = nil
     local info
@@ -604,7 +695,7 @@ test("rough and field distinguish road, dirt, grass and field", function()
     local function surface(opts)
         setSurface(tractor, opts)
         local _, v = lineFor(tractor)
-        return tonumber(v.rough), v.field
+        return tonumber(v.rough), v.field, v.surface
     end
 
     local asphaltMesh, f1 = surface({ contact = WheelContactType.OBJECT })
@@ -625,6 +716,23 @@ test("rough and field distinguish road, dirt, grass and field", function()
     eq(f1, "0") eq(f2, "0") eq(f3, "0") eq(f4, "0") eq(f5, "0", "a meadow is not a field")
     eq(f6, "1") eq(f7, "1") eq(f8, "1")
 
+    -- the kind of surface, which is what the bridge picks its rumble pattern by
+    local function kind(opts) return (select(3, surface(opts))) end
+    eq(kind({ contact = WheelContactType.OBJECT }), "1", "road mesh")
+    eq(kind({ groundDepth = 0 }), "1", "asphalt terrain")
+    eq(kind({ groundDepth = 0.2 }), "2", "dirt road")
+    eq(kind({ groundDepth = 1 }), "3", "soft terrain")
+    eq(kind({ densityType = FieldGroundType.GRASS, groundDepth = 1 }), "3", "meadow")
+    eq(kind({ contact = WheelContactType.GROUND_HEIGHT, hasSnowContact = true }), "4", "snow")
+    eq(kind({ contact = WheelContactType.GROUND_HEIGHT }), "5", "heap")
+    eq(kind({ densityType = FieldGroundType.SOWN, groundDepth = 1 }), "6", "sown field")
+    eq(kind({ densityType = FieldGroundType.CULTIVATED, groundDepth = 1 }), "7", "cultivated")
+    eq(kind({ densityType = FieldGroundType.PLOWED, groundDepth = 1 }), "7", "plowed")
+    eq(kind({ densityType = FieldGroundType.STUBBLE_TILLAGE, groundDepth = 1 }), "7", "stubble tillage")
+    eq(kind({ densityType = FieldGroundType.RIDGE, groundDepth = 1 }), "8", "ridges")
+    eq(kind({ densityType = FieldGroundType.RIDGE_SOWN, groundDepth = 1 }), "8", "sown ridges")
+    eq(kind({ densityType = FieldGroundType.ROLLED_SEEDBED, groundDepth = 1 }), "6", "rolled seedbed")
+
     -- two wheels on the road, two on the field: half way, and still "on the field"
     setSurface(tractor, { densityType = FieldGroundType.SOWN, groundDepth = 1 })
     for shape = 1, 2 do
@@ -633,10 +741,18 @@ test("rough and field distinguish road, dirt, grass and field", function()
     end
     local _, v = lineFor(tractor)
     eq(v.rough, "0.35") eq(v.field, "1")
+    eq(v.surface, "6", "an even split goes to the rougher kind, the one that is felt")
+    -- three wheels on the road: the road wins, whatever the fourth is on
+    do
+        local p = tractor.spec_wheels.wheels[3].physics
+        p.contact, p.densityType, p.groundDepth = WheelContactType.OBJECT, FieldGroundType.NONE, 0
+    end
+    eq(select(2, lineFor(tractor)).surface, "1", "most wheels decide")
 
     -- a field state this script has no entry for still reads as a field
     FieldGroundType.SOMETHING_NEW = 99
     eq((surface({ densityType = 99, groundDepth = 1 })), 0.7, "unknown field state")
+    eq(kind({ densityType = 99, groundDepth = 1 }), "6", "and as a plain field")
 
     -- snow and heaps
     eq((surface({ contact = WheelContactType.GROUND_HEIGHT, hasSnowContact = true })), 0.4, "snow")
@@ -645,10 +761,11 @@ test("rough and field distinguish road, dirt, grass and field", function()
     -- all wheels in the air: rough omitted, field falls back to the vehicle
     setSurface(tractor, { contact = WheelContactType.NONE })
     _, v = lineFor(tractor)
-    eq(v.rough, "0.70", "falls back to getIsOnField") eq(v.field, "1")
+    eq(v.rough, "0.70", "falls back to getIsOnField") eq(v.field, "1") eq(v.surface, "6")
     tractor.getIsOnField = function() return false end
     _, v = lineFor(tractor)
     eq(v.rough, nil, "unknown surface: rough omitted") eq(v.field, "0")
+    eq(v.surface, nil, "and so is the kind")
 end)
 
 test("surface works without the FS25 enums (older wheel layout)", function()
@@ -658,7 +775,7 @@ test("surface works without the FS25 enums (older wheel layout)", function()
     FieldGroundType = nil
     local _, v = lineFor(tractor)
     -- only the terrain depth is left to go on: soft ground
-    eq(v.rough, "0.50") eq(v.field, "0")
+    eq(v.rough, "0.50") eq(v.field, "0") eq(v.surface, "3")
 end)
 
 test("lowered and working follow the implement", function()
@@ -742,6 +859,876 @@ test("a sprayer that is spraying counts as working without being lowered", funct
     attach(tractor, sprayer, { allowsLowering = false })
     local _, v = lineFor(tractor)
     eq(v.lowered, "0") eq(v.working, "1")
+end)
+
+realPrint("engine start and electric drive")
+
+--- A battery tractor: the same machine with a charge consumer and no fuel.
+local function newElectricTractor()
+    local v = newTractor()
+    v.spec_motorized.consumersByFillTypeName = {
+        ELECTRICCHARGE = { fillUnitIndex = 1, fillType = 40 },
+        AIR = { fillUnitIndex = 2, fillType = 34 },
+    }
+    return v
+end
+
+test("diesel: starting is 1 from the start being triggered until the engine runs", function()
+    resetGameGlobals()
+    local tractor = newTractor()
+    local spec = tractor.spec_motorized
+    spec.motor.rpm = 400 -- what the game's motor reports while it is being cranked
+
+    spec.motorState = MotorState.OFF
+    local _, v = lineFor(tractor)
+    eq(v.starting, "0", "off") eq(v.electric, "0") eq(v.rpm, "0")
+
+    spec.motorState = MotorState.IGNITION -- electrics on, engine not turning
+    _, v = lineFor(tractor)
+    eq(v.starting, "0", "ignition only")
+
+    spec.motorState = MotorState.STARTING
+    local info
+    _, v, _, info = lineFor(tractor)
+    eq(v.starting, "1", "starting") eq(v.electric, "0")
+    eq(v.rpm, "0", "rpm keeps its meaning: 0 until the engine runs") eq(v.load, "0.00")
+    eq(info.sources.starting, "getMotorState")
+    check(info.sources.engine:find("(engine not running: reported as 0)", 1, true), info.sources.engine)
+
+    spec.motorState = MotorState.ON
+    spec.motor.rpm = 851
+    _, v = lineFor(tractor)
+    eq(v.starting, "0", "running") eq(v.rpm, "851") eq(v.load, "0.62")
+end)
+
+test("starting: fallbacks, and the key is left out when the vehicle cannot say", function()
+    resetGameGlobals()
+    local tractor = newTractor()
+    local spec = tractor.spec_motorized
+    spec.motorState = MotorState.STARTING
+
+    tractor.getMotorState = nil
+    local _, v, _, info = lineFor(tractor)
+    eq(v.starting, "1") eq(info.sources.starting, "spec_motorized.motorState")
+
+    tractor.getMotorState = function() error("no state today") end
+    _, v, _, info = lineFor(tractor)
+    eq(v.starting, "1", "a raising getter falls back to the field") eq(info.errors.starting, nil)
+
+    tractor.getMotorState = function() return nil end
+    spec.motorState = MotorState.ON
+    _, v = lineFor(tractor)
+    eq(v.starting, "0")
+
+    -- no state anywhere
+    spec.motorState = nil
+    _, v, _, info = lineFor(tractor)
+    eq(v.starting, nil, "unknown: omitted") eq(info.errors.starting, nil) eq(v.electric, "0", "electric does not depend on it")
+
+    -- no MotorState enum (FS22): one flag plus the time the start takes
+    resetGameGlobals()
+    tractor = newTractor()
+    spec = tractor.spec_motorized
+    MotorState = nil
+    tractor.getMotorState, spec.motorState = nil, nil
+    tractor.getIsMotorStarted = function(self) return self.spec_motorized.isMotorStarted end
+    spec.isMotorStarted = true
+    spec.motorStartTime = g_currentMission.time + 800
+    _, v, _, info = lineFor(tractor)
+    eq(v.starting, "1") eq(info.sources.starting, "isMotorStarted+motorStartTime")
+    spec.motorStartTime = g_currentMission.time - 1
+    eq(select(2, lineFor(tractor)).starting, "0", "start time passed")
+    spec.isMotorStarted = false
+    spec.motorStartTime = g_currentMission.time + 800
+    eq(select(2, lineFor(tractor)).starting, "0", "switched off again during the start")
+    spec.isMotorStarted = nil
+    eq(select(2, lineFor(tractor)).starting, nil, "nothing to go on: omitted")
+
+    -- an enum without STARTING, or one that raises on unknown names
+    resetGameGlobals()
+    tractor = newTractor()
+    MotorState = setmetatable({}, { __index = function(_, name) error("no such state " .. tostring(name)) end })
+    _, v, _, info = lineFor(tractor)
+    eq(v.starting, nil) eq(info.errors.starting, nil)
+end)
+
+test("electric vehicle: electric=1, never starting, rpm and load still reported", function()
+    resetGameGlobals()
+    local tractor = newElectricTractor()
+    local spec = tractor.spec_motorized
+    local _, v, _, info = lineFor(tractor)
+    eq(v.electric, "1") eq(v.starting, "0") eq(v.rpm, "1450") eq(v.load, "0.62")
+    eq(info.sources.electric, "consumersByFillTypeName (AIR,ELECTRICCHARGE)")
+    eq(info.sources.starting, "electric: never")
+
+    -- the game runs the same start sequence for it; the contract says never 1
+    for _, state in ipairs({ MotorState.OFF, MotorState.IGNITION, MotorState.STARTING, MotorState.ON }) do
+        spec.motorState = state
+        T.resetVehicleCache()
+        local values = select(2, lineFor(tractor))
+        eq(values.electric, "1") eq(values.starting, "0", "state " .. state)
+    end
+
+    -- also when the vehicle cannot report a motor state at all
+    tractor.getMotorState, spec.motorState = nil, nil
+    _, v = lineFor(tractor)
+    eq(v.electric, "1") eq(v.starting, "0")
+end)
+
+test("electric only when the motor consumes charge and no fuel", function()
+    resetGameGlobals()
+    local function electricWith(names)
+        local tractor = newTractor()
+        local consumers = {}
+        for _, name in ipairs(names) do
+            consumers[name] = { fillUnitIndex = 1 }
+        end
+        tractor.spec_motorized.consumersByFillTypeName = consumers
+        return (T.isElectric(tractor))
+    end
+    eq(electricWith({ "ELECTRICCHARGE" }), true, "battery")
+    eq(electricWith({ "ELECTRICCHARGE", "AIR" }), true, "battery with air brakes")
+    eq(electricWith({ "electricCharge" }), true, "names are compared in upper case")
+    eq(electricWith({ "DIESEL" }), false, "diesel")
+    eq(electricWith({ "DIESEL", "DEF", "AIR" }), false)
+    eq(electricWith({ "METHANE" }), false, "methane")
+    eq(electricWith({ "ELECTRICCHARGE", "DIESEL" }), false, "hybrid: there is an engine")
+    eq(electricWith({ "ELECTRICCHARGE", "METHANE" }), false)
+    eq(electricWith({ "ELECTRICCHARGE", "DEF" }), false, "exhaust fluid means an engine")
+    eq(electricWith({ "ELECTRICCHARGE", "HYDROGEN" }), false, "a fuel this script does not know counts as a fuel")
+    eq(electricWith({ "HYDROGEN" }), false)
+    eq(electricWith({ "AIR" }), false, "nothing but air: not electric")
+    eq(electricWith({}), false, "consumes nothing: not electric")
+
+    -- the hybrid still reports starting
+    local hybrid = newTractor()
+    hybrid.spec_motorized.consumersByFillTypeName = { ELECTRICCHARGE = {}, DIESEL = {} }
+    hybrid.spec_motorized.motorState = MotorState.STARTING
+    local _, v, _, info = lineFor(hybrid)
+    eq(v.electric, "0") eq(v.starting, "1")
+    eq(info.sources.electric, "consumersByFillTypeName (DIESEL,ELECTRICCHARGE)")
+end)
+
+test("electric: consumer list fallback, and the key is left out when unknown", function()
+    resetGameGlobals()
+    local names = { [32] = "DIESEL", [34] = "AIR", [40] = "ELECTRICCHARGE" }
+    g_fillTypeManager = { getFillTypeNameByIndex = function(self, index) return names[index] end }
+
+    local tractor = newTractor()
+    local spec = tractor.spec_motorized
+    spec.consumersByFillTypeName = nil
+    spec.consumers = { { fillType = 40 }, { fillType = 34 } }
+    local _, v, _, info = lineFor(tractor)
+    eq(v.electric, "1") eq(info.sources.electric, "consumers+getFillTypeNameByIndex (AIR,ELECTRICCHARGE)")
+
+    T.resetVehicleCache()
+    spec.consumers = { { fillType = 40 }, { fillType = 32 } }
+    eq(select(2, lineFor(tractor)).electric, "0", "hybrid through the list")
+
+    T.resetVehicleCache()
+    spec.consumers = { { fillType = 40 }, { fillType = 99 } } -- one that has no name
+    _, v, _, info = lineFor(tractor)
+    eq(v.electric, nil, "cannot name a consumer: unknown, omitted") eq(info.errors.electric, nil)
+
+    g_fillTypeManager = nil
+    _, v, _, info = lineFor(tractor)
+    eq(v.electric, nil, "no fill type manager: omitted") eq(info.errors.electric, nil)
+    eq(v.starting, "0", "starting does not depend on it")
+
+    spec.consumers = nil
+    _, v = lineFor(tractor)
+    eq(v.electric, nil, "no consumer tables: omitted")
+
+    -- junk in the tables
+    spec.consumersByFillTypeName = "diesel"
+    spec.consumers = 7
+    _, v, _, info = lineFor(tractor)
+    eq(v.electric, nil) eq(info.errors.electric, nil)
+    spec.consumersByFillTypeName = { [1] = {}, [true] = {}, ELECTRICCHARGE = {} }
+    eq(select(2, lineFor(tractor)).electric, "1", "keys that are not names are skipped")
+
+    -- no motor at all (something towed, a conveyor): both keys omitted, no error
+    local cart = newTractor()
+    cart.spec_motorized = nil
+    _, v, _, info = lineFor(cart)
+    eq(v.starting, nil) eq(v.electric, nil) eq(v.rpm, nil)
+    check(next(info.errors) == nil, "no errors")
+
+    -- a manager that raises costs the key, not the line
+    T.resetVehicleCache()
+    g_fillTypeManager = { getFillTypeNameByIndex = function() error("manager exploded") end }
+    tractor = newTractor()
+    tractor.spec_motorized.consumersByFillTypeName = nil
+    tractor.spec_motorized.consumers = { { fillType = 40 } }
+    _, v, _, info = lineFor(tractor)
+    eq(v.electric, nil) check(info.errors.electric ~= nil, "reported to the caller")
+    eq(v.starting, "0") eq(v.speed, "5.42")
+end)
+
+test("the drive is worked out once per driven vehicle", function()
+    resetGameGlobals()
+    T.resetVehicleCache()
+    local calls = 0
+    local isElectric = T.isElectric
+    T.isElectric = function(vehicle)
+        calls = calls + 1
+        return isElectric(vehicle)
+    end
+
+    local diesel, battery = newTractor(), newElectricTractor()
+    for _ = 1, 100 do
+        eq(select(2, lineFor(diesel)).electric, "0")
+    end
+    eq(calls, 1, "one look for a hundred frames")
+
+    for _ = 1, 100 do
+        eq(select(2, lineFor(battery)).electric, "1")
+    end
+    eq(calls, 2, "another vehicle: looked up again")
+    local _, _, _, info = lineFor(battery)
+    eq(info.sources.electric, "consumersByFillTypeName (AIR,ELECTRICCHARGE)", "the source is remembered with the answer")
+
+    eq(select(2, lineFor(diesel)).electric, "0", "back in the first one: its own answer, not the last one's")
+    eq(calls, 3)
+
+    -- on foot in between: nothing is kept
+    T.gather(nil)
+    lineFor(diesel)
+    eq(calls, 4)
+    T.resetVehicleCache()
+    lineFor(diesel)
+    eq(calls, 5)
+
+    -- "unknown" is not remembered: it is asked again until there is an answer
+    local unknown = newTractor()
+    unknown.spec_motorized.consumersByFillTypeName = nil
+    lineFor(unknown) lineFor(unknown) lineFor(unknown)
+    eq(calls, 8)
+    unknown.spec_motorized.consumersByFillTypeName = { ELECTRICCHARGE = {} }
+    eq(select(2, lineFor(unknown)).electric, "1")
+    lineFor(unknown)
+    eq(calls, 9)
+
+    T.isElectric = isElectric
+    T.resetVehicleCache()
+end)
+
+test("idle and maximum engine speed: reported whether or not the engine runs, both or neither", function()
+    resetGameGlobals()
+    T.resetVehicleCache()
+    local tractor = newTractor()
+    local spec = tractor.spec_motorized
+    local _, v, _, info = lineFor(tractor)
+    eq(v.rpmmin, "850") eq(v.rpmmax, "2200") eq(v.rpm, "1450")
+    eq(info.sources.rpmrange, "motor:getMinRpm/getMaxRpm (850..2200)")
+
+    -- they describe the machine: the same with the engine off or being started
+    for _, state in ipairs({ MotorState.OFF, MotorState.IGNITION, MotorState.STARTING }) do
+        spec.motorState = state
+        local values = select(2, lineFor(tractor))
+        eq(values.rpm, "0") eq(values.rpmmin, "850", "state " .. state) eq(values.rpmmax, "2200")
+    end
+    spec.motorState = MotorState.ON
+
+    -- an electric vehicle has them too
+    T.resetVehicleCache()
+    local battery = newTractor()
+    battery.spec_motorized.consumersByFillTypeName = { ELECTRICCHARGE = {} }
+    battery.spec_motorized.motor.minRpm, battery.spec_motorized.motor.maxRpm = 0, 9000
+    _, v = lineFor(battery)
+    eq(v.electric, "1") eq(v.rpmmin, "0") eq(v.rpmmax, "9000")
+
+    local function range(change)
+        T.resetVehicleCache()
+        local vehicle = newTractor()
+        change(vehicle, vehicle.spec_motorized.motor)
+        local _, values, _, details = lineFor(vehicle)
+        check(details.errors.rpmrange == nil, "no error")
+        check((values.rpmmin == nil) == (values.rpmmax == nil), "both or neither")
+        return values.rpmmin, values.rpmmax, details.sources.rpmrange
+    end
+
+    -- fallbacks: the motor through getMotor(), the plain fields, getters that raise
+    local low, high, source = range(function(vehicle, motor)
+        vehicle.spec_motorized.motor = nil
+        vehicle.getMotor = function() return motor end
+        vehicle.getMotorRpmReal, vehicle.getMotorLoadPercentage = nil, nil
+    end)
+    eq(low, "850") eq(high, "2200")
+    low, high, source = range(function(_, motor) motor.getMinRpm, motor.getMaxRpm = nil, nil end)
+    eq(low, "850") eq(high, "2200") eq(source, "motor.minRpm/maxRpm (850..2200)")
+    low, high, source = range(function(_, motor) motor.getMaxRpm = function() error("no") end end)
+    eq(low, "850") eq(high, "2200") eq(source, "motor.minRpm/maxRpm (850..2200)")
+    low, high = range(function(_, motor) motor.getMinRpm = function() return 900.4 end end)
+    eq(low, "900", "whole numbers") eq(high, "2200")
+
+    -- nothing to read, or values that make no sense: both left out
+    local nonsense = {
+        function(_, motor) motor.getMinRpm, motor.getMaxRpm, motor.minRpm, motor.maxRpm = nil, nil, nil, nil end,
+        function(_, motor) motor.getMinRpm, motor.minRpm = nil, nil end, -- only one of the two
+        function(_, motor) motor.minRpm, motor.maxRpm = 2200, 850 end,   -- the wrong way round
+        function(_, motor) motor.minRpm, motor.maxRpm = 1800, 1800 end,  -- no range
+        function(_, motor) motor.minRpm = -100 end,
+        function(_, motor) motor.maxRpm = 0 end,
+        function(_, motor) motor.maxRpm = 250000 end,                    -- absurd
+        function(_, motor) motor.maxRpm = math.huge end,
+        function(_, motor) motor.minRpm = 0 / 0 end,
+        function(_, motor) motor.minRpm, motor.maxRpm = "850", "2200" end,
+        function(vehicle) vehicle.spec_motorized.motor = "motor" end,
+        function(vehicle) vehicle.spec_motorized.motor = nil vehicle.getMotor = function() error("no motor") end end,
+        function(vehicle) vehicle.spec_motorized = nil end,
+    }
+    for index, change in ipairs(nonsense) do
+        low, high, source = range(change)
+        eq(low, nil, "case " .. index) eq(high, nil, "case " .. index) eq(source, nil, "case " .. index)
+    end
+end)
+
+test("idle and maximum engine speed are read once per driven vehicle", function()
+    resetGameGlobals()
+    T.resetVehicleCache()
+    local calls = 0
+    local getRpmRange = T.getRpmRange
+    T.getRpmRange = function(vehicle)
+        calls = calls + 1
+        return getRpmRange(vehicle)
+    end
+
+    local first, second = newTractor(), newTractor()
+    second.spec_motorized.motor.minRpm, second.spec_motorized.motor.maxRpm = 700, 2500
+    for _ = 1, 100 do
+        eq(select(2, lineFor(first)).rpmmax, "2200")
+    end
+    eq(calls, 1)
+    local _, v = lineFor(second)
+    eq(v.rpmmin, "700") eq(v.rpmmax, "2500", "another vehicle: its own values")
+    eq(calls, 2)
+    eq(select(2, lineFor(first)).rpmmax, "2200")
+    eq(calls, 3)
+    T.gather(nil) -- on foot
+    lineFor(first)
+    eq(calls, 4)
+
+    -- "unknown" is not kept: asked again until there is an answer
+    local unknown = newTractor()
+    unknown.spec_motorized.motor.maxRpm = 0
+    lineFor(unknown) lineFor(unknown)
+    eq(calls, 6)
+    unknown.spec_motorized.motor.maxRpm = 2100
+    eq(select(2, lineFor(unknown)).rpmmax, "2100")
+    lineFor(unknown)
+    eq(calls, 7)
+    T.getRpmRange = getRpmRange
+    T.resetVehicleCache()
+end)
+
+realPrint("bumps")
+
+local FRAME = 1000 / 60
+
+--- A tractor that has been driving on even ground long enough for the bump
+-- detection to have settled.
+local function settledTractor()
+    resetGameGlobals()
+    T.resetVehicleCache()
+    T.resetBumpNotes()
+    local tractor = newTractor()
+    for _ = 1, 90 do
+        T.updateBumps(tractor, FRAME)
+    end
+    return tractor, tractor.spec_wheels.wheels
+end
+
+--- One frame: set the load on some wheels (by index), update, read back.
+local function bumpFrame(tractor, loads, dt)
+    local wheels = tractor.spec_wheels.wheels
+    for index, wheel in ipairs(wheels) do
+        local base = index <= 2 and 1.8 or 2.4
+        wheel.physics.load = base * ((loads and loads[index]) or 1)
+    end
+    local note = T.updateBumps(tractor, dt or FRAME)
+    local left, right = T.getBumps(tractor)
+    return left, right, note
+end
+
+test("which wheels: the steered wheels of the front-most steered axle, by side", function()
+    resetGameGlobals()
+    local function pick(vehicle)
+        local entries, description = T.findBumpWheels(vehicle)
+        if entries == nil then
+            return nil
+        end
+        local left, right = {}, {}
+        for _, entry in ipairs(entries) do
+            if entry.left then left[#left + 1] = entry.physics.wheelShape end
+            if entry.right then right[#right + 1] = entry.physics.wheelShape end
+        end
+        table.sort(left) table.sort(right)
+        return table.concat(left, ",") .. "|" .. table.concat(right, ","), description
+    end
+    local function physics(vehicle, index)
+        return vehicle.spec_wheels.wheels[index].physics
+    end
+    local function steer(vehicle, index, on)
+        local p = physics(vehicle, index)
+        p.rotMax, p.rotMin, p.rotSpeed = on and 0.5 or 0, on and -0.5 or 0, on and 1 or 0
+    end
+
+    -- an ordinary tractor: front wheels steer
+    local tractor = newTractor()
+    local sides, description = pick(tractor)
+    eq(sides, "1|2") eq(description, "steered wheels (1 left, 1 right)")
+
+    -- the side comes from where the wheel is, not from the isLeft flag (which defaults to true)
+    tractor.spec_wheels.wheels[2].isLeft = true
+    eq((pick(tractor)), "1|2")
+
+    -- any one of the steering values marks a steered wheel
+    tractor = newTractor()
+    physics(tractor, 1).rotMax, physics(tractor, 1).rotMin = 0, 0 -- rotSpeed alone
+    physics(tractor, 2).rotSpeed = 0 -- limits alone (the game zeroes rotSpeed at times)
+    eq((pick(tractor)), "1|2")
+
+    -- four wheel steering: the front pair only
+    tractor = newTractor()
+    steer(tractor, 3, true) steer(tractor, 4, true)
+    eq((pick(tractor)), "1|2")
+
+    -- a combine steers with its rear wheels: those are the steered wheels
+    tractor = newTractor()
+    steer(tractor, 1, false) steer(tractor, 2, false) steer(tractor, 3, true) steer(tractor, 4, true)
+    eq((pick(tractor)), "3|4")
+
+    -- two steered axles (a truck): the front-most one; twin wheels on it all count
+    tractor = newTractor()
+    for shape = 5, 8 do
+        tractor.spec_wheels.wheels[shape] = newWheel(shape)
+        steer(tractor, shape, true)
+    end
+    physics(tractor, 5).positionZ, physics(tractor, 6).positionZ = 0.2, 0.2      -- second steered axle
+    physics(tractor, 7).positionZ, physics(tractor, 8).positionZ = 1.45, 1.45    -- outer twins on the front axle
+    physics(tractor, 7).positionX, physics(tractor, 8).positionX = 1.4, -1.4
+    sides, description = pick(tractor)
+    eq(sides, "1,7|2,8") eq(description, "steered wheels (2 left, 2 right)")
+
+    -- nothing steers (the frame bends, or it runs on tracks): the front-most axle
+    tractor = newTractor()
+    steer(tractor, 1, false) steer(tractor, 2, false)
+    sides, description = pick(tractor)
+    eq(sides, "1|2") eq(description, "front axle (no steered wheels) (1 left, 1 right)")
+
+    -- a single wheel on the centre line counts for both sides
+    tractor = newTractor()
+    tractor.spec_wheels.wheels[2] = nil
+    physics(tractor, 1).positionX = 0.01
+    eq((pick(tractor)), "1|1")
+
+    -- positions through the scene graph are preferred when the game offers them
+    tractor = newTractor()
+    tractor.rootNode = "root"
+    local where = { [1] = { -0.9, 1.4 }, [2] = { 0.9, 1.4 }, [3] = { 0.9, -1.2 }, [4] = { -0.9, -1.2 } }
+    for index, wheel in ipairs(tractor.spec_wheels.wheels) do
+        wheel.repr = "repr" .. index
+    end
+    localToLocal = function(node, root, x, y, z)
+        eq(root, "root")
+        local index = tonumber(node:match("%d+"))
+        return where[index][1], 0.5, where[index][2]
+    end
+    eq((pick(tractor)), "2|1", "the scene graph says wheel 1 is on the right")
+    localToLocal = function() error("no scene graph") end
+    eq((pick(tractor)), "1|2", "falls back to the wheel's own position")
+    localToLocal = nil
+
+    -- no positions at all: steered wheels are still known, sides from isLeft
+    tractor = newTractor()
+    for _, wheel in ipairs(tractor.spec_wheels.wheels) do
+        wheel.physics.positionX, wheel.physics.positionZ = nil, nil
+    end
+    eq((pick(tractor)), "1|2")
+    -- ... but without steered wheels "front" cannot be told
+    steer(tractor, 1, false) steer(tractor, 2, false)
+    eq((pick(tractor)), nil)
+
+    -- nothing usable
+    eq((pick({})), nil)
+    eq((pick({ spec_wheels = { wheels = { "wheel", 7, {}, { physics = "p" }, { physics = {} } } } })), nil)
+end)
+
+test("even ground: both stay at 0", function()
+    local tractor = settledTractor()
+    local highest = 0
+    for i = 1, 600 do
+        -- the load wanders by a tenth, differently on each wheel
+        local left, right = bumpFrame(tractor, { 1 + 0.1 * math.sin(i * 0.7), 1 + 0.1 * math.cos(i * 0.31), 1.05, 0.95 })
+        highest = math.max(highest, left, right)
+    end
+    eq(highest, 0)
+    local _, v = lineFor(tractor)
+    eq(v.bumpl, "0.00") eq(v.bumpr, "0.00")
+end)
+
+test("a step under the left wheel: bumpl jumps, is held, and is back at 0 after 150 ms", function()
+    local tractor = settledTractor()
+    local left, right = bumpFrame(tractor, { 3 }) -- three times its load for one frame
+    near(left, 0.6, 1e-6, "peak: (3.0 - 1.5) / (4.0 - 1.5)")
+    eq(right, 0, "the right wheel felt nothing")
+    local _, v = lineFor(tractor)
+    eq(v.bumpl, "0.60") eq(v.bumpr, "0.00")
+
+    -- the hit is over after one frame; a reader polling at 60 Hz still sees it
+    local previous, elapsed = left, 0
+    for _ = 1, 8 do
+        left, right = bumpFrame(tractor)
+        elapsed = elapsed + FRAME
+        check(left < previous and left > 0, string.format("falling but still there after %.0f ms: %s", elapsed, tostring(left)))
+        near(left, 0.6 * (1 - elapsed / 150), 1e-6, "falls in a straight line")
+        eq(right, 0)
+        previous = left
+    end
+    left = bumpFrame(tractor) -- 150 ms after the hit
+    check(left < 1e-9, "gone after 150 ms: " .. tostring(left))
+    eq((bumpFrame(tractor)), 0)
+    eq(select(2, lineFor(tractor)).bumpl, "0.00")
+
+    -- a second, smaller hit while the first is still held does not lower it; a bigger one raises it
+    bumpFrame(tractor, { 3 })
+    left = bumpFrame(tractor, { 2 })
+    near(left, 0.6 * (1 - FRAME / 150), 1e-2, "the smaller hit is under the held value")
+    left = bumpFrame(tractor, { 3.5 })
+    check(left > 0.7, "the bigger hit takes over: " .. tostring(left))
+end)
+
+test("the right wheel, both wheels, and how hard", function()
+    local tractor = settledTractor()
+    local left, right = bumpFrame(tractor, { 1, 3 })
+    eq(left, 0) near(right, 0.6, 1e-6)
+
+    tractor = settledTractor()
+    left, right = bumpFrame(tractor, { 3, 3 })
+    near(left, 0.6, 1e-6) near(right, 0.6, 1e-6, "both together: both rise")
+
+    -- scale: 1.5 times the load is where it starts, 2.25 the "clear bump" 0.3, 4 and more the full 1
+    for _, case in ipairs({ { 1.4, 0 }, { 1.5, 0 }, { 2.25, 0.3 }, { 4, 1 }, { 25, 1 } }) do
+        tractor = settledTractor()
+        left = bumpFrame(tractor, { case[1] })
+        near(left, case[2], 1e-6, "load x" .. case[1])
+        local _, v = lineFor(tractor)
+        eq(v.bumpl, string.format("%.2f", case[2]))
+    end
+
+    -- a rear (not steered) wheel being hit is not reported
+    tractor = settledTractor()
+    left, right = bumpFrame(tractor, { 1, 1, 5, 5 })
+    eq(left, 0) eq(right, 0)
+
+    -- with the driving position turned round, the sides swap
+    tractor = settledTractor()
+    tractor.spec_reverseDriving = { isReverseDriving = true }
+    left, right = bumpFrame(tractor, { 3 })
+    eq(left, 0) near(right, 0.6, 1e-6, "the vehicle's left is the driver's right")
+    tractor.spec_reverseDriving.isReverseDriving = false
+    left, right = T.getBumps(tractor)
+    near(left, 0.6, 1e-6) eq(right, 0)
+end)
+
+test("standing still nothing counts; crawling over a log does", function()
+    local tractor = settledTractor()
+    tractor.lastSignedSpeed = 0
+    for _ = 1, 60 do
+        bumpFrame(tractor)
+    end
+    local left, right = bumpFrame(tractor, { 4, 4 }) -- an implement drops, the chassis rocks
+    eq(left, 0) eq(right, 0)
+    tractor.lastSignedSpeed = 0.0002 -- 0.2 m/s: still nothing
+    eq((bumpFrame(tractor, { 4 })), 0)
+
+    tractor = settledTractor()
+    tractor.lastSignedSpeed = 0.0006 -- 0.6 m/s, about 2 km/h
+    for _ = 1, 60 do
+        bumpFrame(tractor)
+    end
+    near((bumpFrame(tractor, { 3 })), 0.6, 1e-6, "crawling")
+
+    tractor = settledTractor()
+    tractor.lastSignedSpeed = -0.0008 -- reversing over it
+    near((bumpFrame(tractor, { 3 })), 0.6, 1e-6, "in reverse")
+end)
+
+test("slow changes of load are not bumps", function()
+    -- braking: half as much again on both front wheels, building up over a second
+    local tractor = settledTractor()
+    local highest = 0
+    for i = 1, 240 do
+        local factor = 1 + 0.5 * math.min(i / 60, 1)
+        local left, right = bumpFrame(tractor, { factor, factor })
+        highest = math.max(highest, left, right)
+    end
+    eq(highest, 0, "weight moving forward under braking")
+
+    -- a heavy implement lifts the front: the wheels carry little, then a normal load again
+    tractor = settledTractor()
+    for _ = 1, 600 do
+        bumpFrame(tractor, { 0.1, 0.1 })
+    end
+    local left, right = bumpFrame(tractor, { 0.3, 0.3 })
+    eq(left, 0, "three times next to nothing is not a hit") eq(right, 0)
+
+    -- off the ground and down again with the load it had: no bump; down hard: a bump
+    tractor = settledTractor()
+    for _ = 1, 30 do
+        bumpFrame(tractor, { 0, 0 })
+    end
+    left, right = bumpFrame(tractor, { 1, 1 })
+    eq(left, 0) eq(right, 0)
+    tractor = settledTractor()
+    for _ = 1, 30 do
+        bumpFrame(tractor, { 0, 0 })
+    end
+    left = bumpFrame(tractor, { 3, 3 })
+    near(left, 0.6, 1e-6, "landing hard")
+end)
+
+test("no bumps before the running average has settled, or out of a hitch", function()
+    resetGameGlobals()
+    T.resetVehicleCache()
+    local tractor = newTractor()
+    for _ = 1, 5 do
+        bumpFrame(tractor)
+    end
+    eq((bumpFrame(tractor, { 4 })), 0, "83 ms after getting in")
+    for _ = 1, 40 do
+        bumpFrame(tractor)
+    end
+    check((bumpFrame(tractor, { 4 })) > 0.9, "after the first half second")
+
+    -- a frame that took two seconds (a save): whatever changed in it is not a jolt
+    tractor = settledTractor()
+    eq((bumpFrame(tractor, { 4, 4 }, 2000)), 0)
+    eq((bumpFrame(tractor)), 0)
+    -- odd frame times are harmless
+    for _, dt in ipairs({ 0, -5, 0 / 0, math.huge }) do
+        local left, right = bumpFrame(tractor, nil, dt)
+        check(left == 0 and right == 0, "dt " .. tostring(dt))
+    end
+    local ok = pcall(T.updateBumps, tractor, nil)
+    check(ok, "nil dt")
+    eq(T.updateBumps(nil, FRAME), nil, "no vehicle")
+end)
+
+test("fallbacks: contact force, then suspension speed; keys left out when there is nothing", function()
+    -- no getTireLoad on the wheels: the engine's contact force is used the same way
+    resetGameGlobals()
+    T.resetVehicleCache()
+    local tractor = newTractor()
+    local force = { 17.6, 17.6, 23.5, 23.5 }
+    getWheelShapeContactForce = function(node, shape) return -force[shape] end -- sign and unit do not matter
+    for _, wheel in ipairs(tractor.spec_wheels.wheels) do
+        wheel.physics.getTireLoad = nil
+    end
+    for _ = 1, 90 do
+        T.updateBumps(tractor, FRAME)
+    end
+    force[2] = 17.6 * 3
+    T.updateBumps(tractor, FRAME)
+    local left, right, source = T.getBumps(tractor)
+    eq(left, 0) near(right, 0.6, 1e-6)
+    eq(source, "tire load against its running average of the steered wheels (1 left, 1 right)")
+    force[2] = 17.6
+    getWheelShapeContactForce = function(node, shape) return nil end -- nothing touches: no contact, not an error
+    T.updateBumps(tractor, FRAME)
+
+    -- a getTireLoad that raises falls through to the contact force as well
+    resetGameGlobals()
+    T.resetVehicleCache()
+    tractor = newTractor()
+    getWheelShapeContactForce = function() return 10 end
+    for _, wheel in ipairs(tractor.spec_wheels.wheels) do
+        wheel.physics.getTireLoad = function() error("no load today") end
+    end
+    local _, v, _, info = lineFor(tractor)
+    eq(v.bumpl, "0.00") eq(info.errors.bumps, nil)
+
+    -- neither: how fast the suspension moves
+    resetGameGlobals()
+    T.resetVehicleCache()
+    tractor = newTractor()
+    local wheels = tractor.spec_wheels.wheels
+    for _, wheel in ipairs(wheels) do
+        wheel.physics.getTireLoad = nil
+    end
+    for _ = 1, 90 do
+        T.updateBumps(tractor, FRAME)
+    end
+    left, right, source = T.getBumps(tractor)
+    eq(left, 0) eq(right, 0)
+    eq(source, "suspension speed of the steered wheels (1 left, 1 right)")
+    wheels[1].physics.netInfo.suspensionLength = 0.1 - 0.0125 -- 12.5 mm in one frame: 0.75 m/s
+    T.updateBumps(tractor, FRAME)
+    left, right = T.getBumps(tractor)
+    near(left, 0.5, 1e-6, "(0.75 - 0.25) / (1.25 - 0.25)") eq(right, 0)
+    wheels[1].physics.netInfo.suspensionLength = 0.1 -- and back out just as fast: also a jolt
+    T.updateBumps(tractor, FRAME)
+    near((T.getBumps(tractor)), 0.5, 1e-6)
+    for i = 1, 300 do -- ordinary movement, 2 mm a frame (0.12 m/s): nothing
+        wheels[1].physics.netInfo.suspensionLength = 0.1 + 0.002 * (i % 2)
+        T.updateBumps(tractor, FRAME)
+    end
+    eq((T.getBumps(tractor)), 0)
+    wheels[2].physics.netInfo.suspensionLength = 0.02 -- bottoming out in one frame
+    T.updateBumps(tractor, FRAME)
+    eq(select(2, T.getBumps(tractor)), 1, "never above 1")
+
+    -- nothing to measure with: both keys left out, and no error
+    resetGameGlobals()
+    T.resetVehicleCache()
+    tractor = newTractor()
+    for _, wheel in ipairs(tractor.spec_wheels.wheels) do
+        wheel.physics.getTireLoad = nil
+        wheel.physics.netInfo.suspensionLength = nil
+    end
+    T.updateBumps(tractor, FRAME)
+    _, v, _, info = lineFor(tractor)
+    eq(v.bumpl, nil) eq(v.bumpr, nil) eq(info.errors.bumps, nil)
+    eq(info.sources.bumps, "none (neither tire load nor suspension length can be read)")
+
+    -- no wheels
+    T.resetVehicleCache()
+    tractor = newTractor()
+    tractor.spec_wheels = nil
+    _, v, _, info = lineFor(tractor)
+    eq(v.bumpl, nil) eq(v.bumpr, nil) eq(info.sources.bumps, "none (no usable wheels)")
+
+    -- only a left wheel: only bumpl
+    T.resetVehicleCache()
+    tractor = newTractor()
+    local p2 = tractor.spec_wheels.wheels[2].physics
+    p2.rotMax, p2.rotMin, p2.rotSpeed = 0, 0, 0
+    _, v = lineFor(tractor)
+    eq(v.bumpl, "0.00") eq(v.bumpr, nil, "no steered wheel on the right: left out")
+end)
+
+test("multiplayer client: the keys are left out", function()
+    resetGameGlobals()
+    T.resetVehicleCache()
+    local tractor = newTractor()
+    tractor.isServer = false
+    for _ = 1, 90 do
+        T.updateBumps(tractor, FRAME)
+    end
+    tractor.spec_wheels.wheels[1].physics.load = 10
+    T.updateBumps(tractor, FRAME)
+    local _, v, _, info = lineFor(tractor)
+    eq(v.bumpl, nil) eq(v.bumpr, nil)
+    eq(info.sources.bumps, "none (multiplayer client: wheel physics is not local)")
+    eq(info.errors.bumps, nil)
+end)
+
+test("the wheels are picked once per driven vehicle, and nothing carries over to the next", function()
+    resetGameGlobals()
+    T.resetVehicleCache()
+    local calls = 0
+    local findBumpWheels = T.findBumpWheels
+    T.findBumpWheels = function(vehicle)
+        calls = calls + 1
+        return findBumpWheels(vehicle)
+    end
+
+    local first, second = newTractor(), newTractor()
+    for _ = 1, 300 do
+        T.updateBumps(first, FRAME)
+        lineFor(first)
+    end
+    eq(calls, 1, "one look for five seconds of driving")
+    first.spec_wheels.wheels[1].physics.load = 1.8 * 3
+    T.updateBumps(first, FRAME)
+    near((T.getBumps(first)), 0.6, 1e-3)
+
+    -- straight into another vehicle: its own wheels, and not the first one's bump
+    T.updateBumps(second, FRAME)
+    eq(calls, 2)
+    eq((T.getBumps(second)), 0)
+    eq(select(2, lineFor(second)).bumpl, "0.00")
+
+    -- "nothing to go on" is remembered as well
+    local bare = newTractor()
+    bare.spec_wheels = nil
+    for _ = 1, 50 do
+        T.updateBumps(bare, FRAME)
+        lineFor(bare)
+    end
+    eq(calls, 3)
+
+    -- on foot in between, or a reset: looked up again
+    T.gather(nil)
+    first.spec_wheels.wheels[1].physics.load = 1.8
+    T.updateBumps(first, FRAME)
+    eq(calls, 4)
+    eq((T.getBumps(first)), 0, "and the held bump is gone with the cache")
+    T.findBumpWheels = findBumpWheels
+    T.resetVehicleCache()
+end)
+
+test("the few notes for the game log: first strong bump, and what was measured on and off a field", function()
+    local tractor = settledTractor()
+    local notes = {}
+    local function frames(count, loads, onField)
+        for _ = 1, count do
+            local wheels = tractor.spec_wheels.wheels
+            wheels[1].physics.load = 1.8 * ((loads and loads[1]) or 1)
+            wheels[2].physics.load = 1.8 * ((loads and loads[2]) or 1)
+            local note = T.updateBumps(tractor, FRAME, onField)
+            if note ~= nil then
+                notes[#notes + 1] = note
+            end
+        end
+    end
+
+    frames(1, { 2.5 }) -- 0.4: not worth a note
+    eq(#notes, 0)
+    frames(10)
+    frames(1, { 1, 3 })
+    eq(notes[1], "first strong bump: right wheel 0.60 at 5.4 m/s, measured 3.00 (tire load as a multiple of its running average; a bump counts from 1.50, full at 4.00)")
+    frames(10)
+    frames(1, { 4, 4 })
+    eq(#notes, 1, "only the first one")
+
+    -- twenty seconds of driving on a field, then off it: one summary each
+    tractor = settledTractor()
+    notes = {}
+    frames(600, nil, true)
+    eq(#notes, 0, "ten seconds: not yet")
+    frames(1, { 1.3, 1.1 }, true)
+    frames(650, nil, true)
+    eq(#notes, 1)
+    eq(notes[1], "bump check after 20 s of driving on a field: highest left 1.30, right 1.10 (tire load as a multiple of its running average; a bump counts from 1.50, full at 4.00)")
+    frames(1300, nil, true)
+    eq(#notes, 1, "once")
+    frames(1300, nil, false)
+    eq(#notes, 2)
+    check(notes[2]:find("^bump check after 20 s of driving off the fields: highest left 1%.%d%d, right 1%.%d%d "), notes[2])
+    frames(1300, nil, nil)
+    eq(#notes, 2)
+
+    -- standing still does not count towards the twenty seconds
+    tractor = settledTractor()
+    notes = {}
+    tractor.lastSignedSpeed = 0
+    frames(2000, nil, true)
+    eq(#notes, 0)
+
+    -- with the suspension signal the notes say so
+    resetGameGlobals()
+    T.resetVehicleCache()
+    T.resetBumpNotes()
+    tractor = newTractor()
+    for _, wheel in ipairs(tractor.spec_wheels.wheels) do
+        wheel.physics.getTireLoad = nil
+    end
+    T.updateBumps(tractor, FRAME)
+    tractor.spec_wheels.wheels[1].physics.netInfo.suspensionLength = 0.08
+    eq(T.updateBumps(tractor, FRAME), "first strong bump: left wheel 0.95 at 5.4 m/s, measured 1.20 (suspension speed in m/s; a bump counts from 0.25, full at 1.25)")
+    T.resetBumpNotes()
 end)
 
 realPrint("robustness")
@@ -1365,7 +2352,7 @@ test("the script registers one listener and logs its version", function()
     eq(#listeners, 1) eq(listeners[1], mod)
     check(type(mod.loadMap) == "function" and type(mod.update) == "function" and type(mod.deleteMap) == "function", "listener functions")
     eq(countLogs("^%[MozaYokeLink%] version " .. mod.VERSION:gsub("%.", "%%.") .. " script loaded$"), 1)
-    eq(mod.VERSION, "0.1.1.0", "matches modDesc.xml")
+    eq(mod.VERSION, "0.1.2.0", "matches modDesc.xml")
     eq(mod.suppressGameForceFeedback, true, "the switch defaults to on")
     unloadMod()
 end)
@@ -1427,6 +2414,128 @@ test("driving: the file is one valid line, seq goes up by one per write", functi
     check(lastSeq >= 2 + 118 and lastSeq <= 2 + 120, "about 60 writes a second, got seq " .. lastSeq)
     eq(countLogs("driving 'Mock Tractor 7R' %(found via g_localPlayer:getCurrentVehicle%)"), 1, "vehicle logged once")
     check(logText():find("speed<-lastSignedSpeed; steer<-rotatedTime", 1, true), "sources logged")
+    unloadMod()
+end)
+
+test("starting and electric reach the file and the one-time sources line", function()
+    local mod = loadMod()
+    mod:loadMap("map")
+    local tractor = newContractScene()
+    local spec = tractor.spec_motorized
+    spec.motorState = MotorState.STARTING
+    drive(mod, tractor, 5)
+    local v = fileValues()
+    eq(v.starting, "1") eq(v.electric, "0") eq(v.rpm, "0")
+    spec.motorState = MotorState.ON
+    drive(mod, tractor, 5)
+    v = fileValues()
+    eq(v.starting, "0") eq(v.electric, "0") eq(v.rpm, "1450")
+    check(logText():find("engine<-getMotorRpmReal/getMotorLoadPercentage/(engine not running: reported as 0); rpmrange<-motor:getMinRpm/getMaxRpm (850..2200); starting<-getMotorState; electric<-consumersByFillTypeName (AIR,DEF,DIESEL); slip<-", 1, true),
+        "sources line: " .. logText())
+
+    -- another vehicle: its own answer, worked out once, and logged for it
+    local calls = 0
+    local isElectric = MozaTelemetry.isElectric
+    MozaTelemetry.isElectric = function(vehicle)
+        calls = calls + 1
+        return isElectric(vehicle)
+    end
+    local battery = newContractScene()
+    battery.spec_motorized.consumersByFillTypeName = { ELECTRICCHARGE = {}, AIR = {} }
+    battery.spec_motorized.motorState = MotorState.STARTING
+    drive(mod, battery, 300)
+    v = fileValues()
+    eq(v.electric, "1") eq(v.starting, "0", "never starting when electric") eq(v.rpm, "0")
+    eq(calls, 1, "one look in five seconds of driving")
+    check(logText():find("starting<-electric: never; electric<-consumersByFillTypeName (AIR,ELECTRICCHARGE);", 1, true), "sources line for the electric vehicle")
+
+    drive(mod, tractor, 60)
+    eq((fileValues()).electric, "0", "back in the diesel")
+    eq(calls, 2)
+
+    -- on foot, then the same vehicle again; and a new savegame: nothing is carried over
+    drive(mod, nil, 5)
+    eq((fileValues()).electric, nil, "not driving: the keys are not written")
+    drive(mod, tractor, 5)
+    eq(calls, 3)
+    mod:deleteMap()
+    mod:loadMap("map")
+    drive(mod, tractor, 5)
+    eq(calls, 4, "the cache does not outlive the savegame")
+    eq(countLogs("problem:"), 0)
+    unloadMod()
+end)
+
+test("bumps are looked for on every frame, reach the file, and leave their notes in the log", function()
+    local mod = loadMod()
+    mod:loadMap("map")
+    local tractor = newContractScene()
+    local front = tractor.spec_wheels.wheels[1].physics
+    drive(mod, tractor, 90)
+    local v = fileValues()
+    eq(v.bumpl, "0.00") eq(v.bumpr, "0.00")
+    check(logText():find("; bumps<-tire load against its running average of the steered wheels (1 left, 1 right)", 1, true), "sources line")
+
+    front.load = 1.8 * 3 -- the left front wheel hits something for one frame
+    drive(mod, tractor, 1)
+    front.load = 1.8
+    v = fileValues()
+    eq(v.bumpl, "0.60") eq(v.bumpr, "0.00")
+    drive(mod, tractor, 4)
+    local held = tonumber((fileValues()).bumpl)
+    check(held > 0.2 and held < 0.5, "still held four frames later: " .. held)
+    drive(mod, tractor, 6)
+    eq((fileValues()).bumpl, "0.00", "gone after 150 ms")
+    eq(countLogs("^%[MozaYokeLink%] first strong bump: left wheel 0%.60 at 5%.4 m/s, measured 3%.00 %(tire load as a multiple of its running average; a bump counts from 1%.50, full at 4%.00%)$"), 1)
+
+    -- at 240 fps only every fourth frame writes; a hit on a frame in between is not lost
+    local fast = 1000 / 240
+    drive(mod, tractor, 240, fast)
+    front.load = 1.8 * 3
+    drive(mod, tractor, 1, fast)
+    front.load = 1.8
+    drive(mod, tractor, 4, fast)
+    held = tonumber((fileValues()).bumpl)
+    check(held > 0.45 and held <= 0.6, "seen by the next write: " .. held)
+    drive(mod, tractor, 60, fast)
+
+    -- straight into another vehicle while a bump is held: it does not come along
+    front.load = 1.8 * 6
+    drive(mod, tractor, 1)
+    front.load = 1.8
+    eq((fileValues()).bumpl, "1.00")
+    local other = newContractScene()
+    drive(mod, other, 1)
+    eq((fileValues()).bumpl, "0.00")
+
+    -- twenty seconds on the field: one summary line, and only one strong-bump line in all
+    drive(mod, other, 1300)
+    eq(countLogs("^%[MozaYokeLink%] bump check after 20 s of driving on a field: highest left %d%.%d%d, right %d%.%d%d %("), 1)
+    drive(mod, other, 1300)
+    eq(countLogs("bump check after 20 s"), 1)
+    eq(countLogs("first strong bump"), 1)
+
+    -- paused: nothing is updated, and the hitch afterwards is not a bump
+    g_currentMission.paused = true
+    other.spec_wheels.wheels[2].physics.load = 1.8 * 4
+    drive(mod, other, 30)
+    g_currentMission.paused = false
+    other.spec_wheels.wheels[2].physics.load = 1.8
+    drive(mod, other, 2)
+    eq((fileValues()).bumpr, "0.00")
+
+    -- a new savegame logs its notes again; a failure in the detection is contained
+    mod:deleteMap()
+    mod:loadMap("map")
+    drive(mod, tractor, 90)
+    front.load = 1.8 * 3
+    drive(mod, tractor, 1)
+    front.load = 1.8
+    eq(countLogs("first strong bump"), 2)
+    MozaTelemetry.updateBumps = function() error("bumps exploded") end
+    drive(mod, tractor, 120)
+    eq(countLogs("problem: bumps: .*bumps exploded"), 1)
+    eq((fileValues()).active, "1", "telemetry carries on")
     unloadMod()
 end)
 

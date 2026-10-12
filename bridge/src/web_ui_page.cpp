@@ -75,6 +75,7 @@ h1 { font-size: 16px; font-weight: 650; }
   appearance: none; border: 1px solid var(--line); background: var(--panel); color: var(--ink);
   border-radius: 8px; padding: 7px 14px; min-height: 38px; font-weight: 550; cursor: pointer;
 }
+a.btn { display: inline-flex; align-items: center; box-sizing: border-box; text-decoration: none; }
 .btn:hover:not(:disabled) { border-color: var(--muted); }
 .btn:disabled { opacity: .45; cursor: default; }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
@@ -270,6 +271,9 @@ input[type=range]:focus-visible::-moz-range-thumb { outline: 2px solid var(--foc
       <span id="dirtyHint"></span>
     </div>
     <div class="actions">
+      <a class="btn" id="export" href="/api/export" download="moza-fs-link-settings.ini" title="Download the settings as they are now, saved or not, as a file">Export</a>
+      <button type="button" class="btn" id="import" disabled title="Load settings from an exported file">Import&hellip;</button>
+      <input type="file" id="importFile" accept=".ini,.txt,text/plain" hidden>
       <button type="button" class="btn" id="reset" disabled>Reset to defaults</button>
       <button type="button" class="btn" id="revert" disabled>Revert</button>
       <button type="button" class="btn primary" id="save" disabled>Save</button>
@@ -293,7 +297,7 @@ const SEND_MS = 70;          // changes made by dragging are sent at most this o
 const $ = id => document.getElementById(id);
 const ui = {};
 for (const id of ['top', 'conn', 'connText', 'connAge', 'forcesBox', 'forces', 'forcesText', 'release', 'statusCard',
-                  'statusNote', 'status', 'settingsBox', 'settings', 'savebar', 'dirtyText', 'dirtyHint', 'reset', 'revert', 'save', 'toast']) {
+                  'statusNote', 'status', 'settingsBox', 'settings', 'savebar', 'dirtyText', 'dirtyHint', 'export', 'import', 'importFile', 'reset', 'revert', 'save', 'toast']) {
   ui[id] = $(id);
 }
 
@@ -808,15 +812,16 @@ function renderSaveBar() {
   ui.save.disabled = idle || !dirty;
   ui.revert.disabled = idle || !dirty;
   ui.reset.disabled = idle || offDefault === 0;
+  ui.import.disabled = idle;
   const title = (dirty ? '\u2022 ' : '') + 'MOZA bridge';
   if (document.title !== title) document.title = title;
 }
 
-function act(path, failure) {
+function act(path, failure, body) {
   clearTimeout(sendTimer);
   sendTimer = 0;
   enqueue(sendPending);
-  enqueue(() => request('POST', path)
+  enqueue(() => request('POST', path, body)
     .then(answer => {
       // These replace every value, including any the user touched a moment ago.
       controls.forEach(c => { c.touched = 0; });
@@ -857,6 +862,33 @@ function confirmed(button, question, run) {
 ui.save.addEventListener('click', () => act('/api/save', 'Not saved'));
 confirmed(ui.revert, 'Discard changes?', () => act('/api/revert', 'Not reverted'));
 confirmed(ui.reset, 'Reset everything?', () => act('/api/reset', 'Not reset'));
+
+// ---- Import and export ----
+
+// Export is a plain download link. Import reads the chosen file here and hands its text to the
+// bridge, which applies what it understands; the values are then unsaved changes like any other.
+const IMPORT_LIMIT = 60000;   // the bridge refuses bodies over 64 KiB
+ui.import.addEventListener('click', () => ui.importFile.click());
+ui.importFile.addEventListener('change', () => {
+  const file = ui.importFile.files && ui.importFile.files[0];
+  // Cleared so that choosing the same file again counts as a change.
+  ui.importFile.value = '';
+  if (!file) return;
+  if (file.size > IMPORT_LIMIT) {
+    toast('Not imported: that file is too large to be a settings file.', true);
+    return;
+  }
+  file.text()
+    .then(text => act('/api/import', 'Not imported', text))
+    .catch(() => toast('Not imported: the file could not be read.', true));
+});
+// A link has no disabled state; while the bridge is not answering there is nothing to download.
+ui.export.addEventListener('click', event => {
+  if (down || !state) {
+    event.preventDefault();
+    toast('Not exported: the bridge is not responding.', true);
+  }
+});
 
 // ---- Start ----
 

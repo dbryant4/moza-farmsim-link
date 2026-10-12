@@ -58,6 +58,20 @@ MOZA_DEVICE_INFO deviceInfo()
     return info;
 }
 
+constexpr MOZA_DEVICE_ID kHandleDeviceId = 2;
+
+MOZA_DEVICE_INFO handleInfo()
+{
+    MOZA_DEVICE_INFO info{};
+    info.id = kHandleDeviceId;
+    std::snprintf(info.name, sizeof(info.name), "Fake Yoke Handle");
+    info.vendorId = 0x346E;
+    info.category = MOZA_DC_AS;
+    info.type     = MOZA_DT_AS_STICK;
+    info.state    = MOZA_DS_NORMAL;
+    return info;
+}
+
 MOZA_ERRNO checkHandle(MOZA_DEVICE_HANDLE handle)
 {
     if (!state().initialized)
@@ -72,6 +86,18 @@ MOZA_ERRNO readParameter(MOZA_DEVICE_HANDLE handle, MOZA_PARAMETER_ID id, MOZA_V
     if (const MOZA_ERRNO err = checkHandle(handle); err != MOZA_ERR_NO_ERROR)
     {
         return err;
+    }
+    if (const auto list = state().listParameters.find(id); list != state().listParameters.end())
+    {
+        if (value != nullptr && Moza_ValueCreate(MOZA_VT_LIST, value, static_cast<MOZA_SIZE>(list->second.size())))
+        {
+            for (std::size_t i = 0; i < list->second.size(); ++i)
+            {
+                value->data.listValue.items[i].type           = MOZA_VT_UINT;
+                value->data.listValue.items[i].data.uintValue = static_cast<uint64_t>(list->second[i]);
+            }
+        }
+        return MOZA_ERR_NO_ERROR;
     }
     const auto found = state().parameters.find(id);
     if (found == state().parameters.end())
@@ -284,16 +310,21 @@ MOZA_ERRNO Moza_DeviceGetList(MOZA_DEVICE_INFO infos[], MOZA_SIZE* infosSize)
     }
 
     const MOZA_SIZE capacity = *infosSize;
-    *infosSize               = 1;
+    const MOZA_SIZE count    = state().handlePresent ? 2 : 1;
+    *infosSize               = count;
     if (!infos)
     {
         return MOZA_ERR_NO_ERROR;
     }
-    if (capacity < 1)
+    if (capacity < count)
     {
         return MOZA_ERR_BUFFER_TOO_SMALL;
     }
     infos[0] = fake_moza::deviceInfo();
+    if (count > 1)
+    {
+        infos[1] = fake_moza::handleInfo();
+    }
     return MOZA_ERR_NO_ERROR;
 }
 
@@ -313,7 +344,8 @@ MOZA_ERRNO Moza_DeviceOpen(MOZA_DEVICE_ID deviceId, MOZA_DEVICE_HANDLE* handle)
     {
         return MOZA_ERR_NOT_INITIALIZED;
     }
-    if (deviceId != fake_moza::kDeviceId || !handle)
+    const bool known = deviceId == fake_moza::kDeviceId || (deviceId == fake_moza::kHandleDeviceId && state().handlePresent);
+    if (!known || !handle)
     {
         return MOZA_ERR_DEVICE_NOT_FOUND;
     }
@@ -383,7 +415,16 @@ MOZA_ERRNO Moza_DeviceParameterSetValue(MOZA_DEVICE_HANDLE handle, MOZA_PARAMETE
     {
         return MOZA_ERR_INVALID_ARGUMENT;
     }
-    state().parameters[parameterId] = numbers.front();
+    if (numbers.size() > 1)
+    {
+        state().listParameters[parameterId] = numbers;
+        state().listWrites.emplace_back(parameterId, numbers);
+    }
+    else
+    {
+        state().parameters[parameterId] = numbers.front();
+    }
+    state().parameterWrites.emplace_back(parameterId, numbers.front());
     return MOZA_ERR_NO_ERROR;
 }
 

@@ -6,7 +6,7 @@
 -- fs-mod/tests). The engine-facing half is MozaYokeLink.lua.
 --
 -- Output contract: docs/telemetry.md. One line, for example
---   MOZAFS 1 seq=4821 t=913400 active=1 speed=5.42 steer=-0.250 mass=8200 rpm=1450 load=0.62 slip=0.04 rough=0.70 field=1 lowered=1 working=1 end=1
+--   MOZAFS 1 seq=4821 t=913400 active=1 speed=5.42 steer=-0.250 mass=8200 rpm=1450 load=0.62 rpmmin=850 rpmmax=2200 slip=0.04 rough=0.70 surface=6 field=1 lowered=1 working=1 starting=0 electric=0 bumpl=0.00 bumpr=0.00 end=1
 --
 -- It also holds the rules for the bridge's presence file (same document,
 -- "Presence file: bridge -> mod"): deciding from a series of reads whether
@@ -61,10 +61,56 @@ M.FIELD_ROUGH_BY_NAME = {
     ROLLED_SEEDBED = 0.55,
 }
 
+-- Kind of surface, key `surface`: what the ground feels like rather than how
+-- rough it is. The numbers are the contract's and never change meaning.
+M.SURFACE = {
+    ROAD = 1,       -- asphalt, concrete, bridges, yard slabs
+    GRAVEL = 2,     -- gravel and dirt tracks
+    GRASS = 3,
+    SNOW = 4,
+    HEAP = 5,       -- a heap of tipped material
+    FIELD = 6,      -- a field with a settled surface, or one we know no better
+    TILLED = 7,     -- broken into clods: ploughed, cultivated
+    RIDGE = 8,      -- laid up in ridges
+}
+M.SURFACE_COUNT = 8
+
+-- Field ground states that are not a plain FIELD, keyed like FIELD_ROUGH_BY_NAME.
+M.FIELD_SURFACE_BY_NAME = {
+    PLOWED = M.SURFACE.TILLED,
+    CULTIVATED = M.SURFACE.TILLED,
+    STUBBLE_TILLAGE = M.SURFACE.TILLED,
+    RIDGE = M.SURFACE.RIDGE,
+    RIDGE_SOWN = M.SURFACE.RIDGE,
+}
+
 -- The game's own thresholds for the terrain "depth" attribute
 -- (WheelsUtil.getGroundType): below 0.1 is road, above 0.8 is soft terrain.
 M.DEPTH_ROAD = 0.1
 M.DEPTH_SOFT = 0.8
+
+-- Bumps: a steered wheel being jolted by something under it (bumpl, bumpr).
+-- The signal is the wheel's tire load against its own running average: a log
+-- or a kerb multiplies the load for an instant, soft or uneven ground moves
+-- it a little, and braking or a lifted implement shift it slowly, which the
+-- running average follows. All of these are first guesses to be calibrated
+-- in the game; the mod logs what it measures (see updateBumps).
+M.BUMP_HOLD_MS = 150        -- a peak is held and falls back to 0 over this time
+M.BUMP_MIN_SPEED = 0.25     -- m/s (0.9 km/h): slower than this nothing counts
+M.BUMP_LOAD_START = 1.5     -- tire load of 1.5 times its running average: bump 0
+M.BUMP_LOAD_FULL = 4.0      -- 4 times: bump 1 (so 2.25 times is the "clear bump" 0.3)
+M.BUMP_BASELINE_MS = 1000   -- time constant of the running average
+M.BUMP_WARMUP_MS = 500      -- no bumps until the average has settled
+M.BUMP_GAP_MS = 250         -- a frame longer than this is a hitch, not a jolt
+-- Fallback when the tire load cannot be read: how fast the suspension moves.
+M.BUMP_SUSP_START = 0.25    -- m/s: bump 0 (the game's dampers call 0.10 m/s "low speed")
+M.BUMP_SUSP_FULL = 1.25     -- m/s: bump 1
+-- Which wheels: the steered ones of the front-most steered axle.
+M.BUMP_AXLE_DEPTH = 0.5     -- m: wheels this close behind the front-most one are the same axle
+M.BUMP_CENTRE_WIDTH = 0.05  -- m: a wheel this close to the centre line counts for both sides
+-- One-time calibration lines in the game log.
+M.BUMP_NOTE_STRONG = 0.5    -- the first bump at least this big is logged
+M.BUMP_NOTE_AFTER_MS = 20000 -- driving time on a field / off a field before its summary
 
 local MAX_IMPLEMENT_DEPTH = 8
 
@@ -142,11 +188,24 @@ local KEYS = {
     { "mass",    function(v) return M.fmtInt(clamp(v, 0, 10000000)) end },
     { "rpm",     function(v) return M.fmtInt(clamp(v, 0, 100000)) end },
     { "load",    function(v) return M.fmtFixed(clamp(v, 0, 1), 2) end },
+    { "rpmmin",  function(v) return M.fmtInt(clamp(v, 0, 100000)) end },
+    { "rpmmax",  function(v) return M.fmtInt(clamp(v, 0, 100000)) end },
     { "slip",    function(v) return M.fmtFixed(clamp(v, 0, 1), 2) end },
     { "rough",   function(v) return M.fmtFixed(clamp(v, 0, 1), 2) end },
+    { "surface", function(v)
+        local kind = math.floor(v + 0.5)
+        if kind >= 1 and kind <= M.SURFACE_COUNT then
+            return M.fmtInt(kind)
+        end
+        return nil
+    end },
     { "field",   flag },
     { "lowered", flag },
     { "working", flag },
+    { "starting", flag },
+    { "electric", flag },
+    { "bumpl",   function(v) return M.fmtFixed(clamp(v, 0, 1), 2) end },
+    { "bumpr",   function(v) return M.fmtFixed(clamp(v, 0, 1), 2) end },
 }
 
 --- Build the telemetry line (including the trailing "\n").
@@ -551,15 +610,559 @@ function M.getEngine(vehicle)
     end
 
     -- A stopped engine keeps its last rpm/load in these fields; report zero.
+    -- getIsMotorStarted is true only once the engine runs, so rpm also reads 0
+    -- while it is being started (the game itself ramps its rpm up from zero
+    -- during that time); the "starting" key covers that span.
     if isFunc(vehicle.getIsMotorStarted) and vehicle:getIsMotorStarted() ~= true then
         if rpm ~= nil then rpm = 0 end
         if load ~= nil then load = 0 end
-        source[3] = "(engine off)"
+        source[3] = "(engine not running: reported as 0)"
     end
 
     if rpm ~= nil then rpm = math.max(rpm, 0) end
     if load ~= nil then load = clamp(load, 0, 1) end
     return rpm, load, table.concat(source, "/")
+end
+
+-- An engine speed above this is not an engine speed.
+M.RPM_RANGE_LIMIT = 30000
+
+--- This vehicle's idle and maximum engine speed (1/min).
+-- VehicleMotor is given both when the vehicle loads (motor#minRpm and
+-- motor#maxRpm of its XML) and never changes them; what limits the engine
+-- while driving (speed limit, rpm limit, PTO) is kept elsewhere. They
+-- describe the machine, so they are reported with the engine off as well.
+-- @return min, max, source; or nil when they cannot be read or make no sense
+function M.getRpmRange(vehicle)
+    local spec = vehicle.spec_motorized
+    if type(spec) ~= "table" then
+        return nil, nil, nil
+    end
+    local motor = spec.motor
+    if motor == nil and isFunc(vehicle.getMotor) then
+        local ok, value = pcall(vehicle.getMotor, vehicle)
+        motor = ok and value or nil
+    end
+    if type(motor) ~= "table" then
+        return nil, nil, nil
+    end
+
+    local low, high, source = nil, nil, nil
+    if isFunc(motor.getMinRpm) and isFunc(motor.getMaxRpm) then
+        local okLow, valueLow = pcall(motor.getMinRpm, motor)
+        local okHigh, valueHigh = pcall(motor.getMaxRpm, motor)
+        if okLow and okHigh and isFinite(valueLow) and isFinite(valueHigh) then
+            low, high, source = valueLow, valueHigh, "motor:getMinRpm/getMaxRpm"
+        end
+    end
+    if low == nil and isFinite(motor.minRpm) and isFinite(motor.maxRpm) then
+        low, high, source = motor.minRpm, motor.maxRpm, "motor.minRpm/maxRpm"
+    end
+    -- both or neither: half a range is of no use to the reader
+    if low == nil or low < 0 or high <= low or high > M.RPM_RANGE_LIMIT then
+        return nil, nil, nil
+    end
+    return low, high, string.format("%s (%s..%s)", source, tostring(M.fmtInt(low)), tostring(M.fmtInt(high)))
+end
+
+--- Is the engine being started right now: from the start being triggered
+-- until the engine runs?
+-- FS25 keeps a motor state per vehicle: OFF, IGNITION (electrics on, engine
+-- not turning), STARTING (Motorized.startMotor sets it; onUpdate moves on to
+-- ON once motorStartTime has passed) and ON. STARTING is that span exactly;
+-- the game's own dashboards use the same test for "only while starting".
+-- @return true/false, or nil when the vehicle offers no way to tell; source
+function M.getStarting(vehicle)
+    local spec = vehicle.spec_motorized
+    if type(spec) ~= "table" then
+        return nil, nil
+    end
+
+    local states = MotorState
+    if type(states) == "table" or type(states) == "userdata" then
+        local okEnum, starting = pcall(function()
+            return states.STARTING
+        end)
+        if okEnum and starting ~= nil then
+            if isFunc(vehicle.getMotorState) then
+                local ok, state = pcall(vehicle.getMotorState, vehicle)
+                if ok and state ~= nil then
+                    return state == starting, "getMotorState"
+                end
+            end
+            if spec.motorState ~= nil then
+                return spec.motorState == starting, "spec_motorized.motorState"
+            end
+        end
+    end
+
+    -- FS22 had one flag, true from the moment the start was triggered, and
+    -- counted the engine as running once motorStartTime had passed.
+    local mission = g_currentMission
+    local now = type(mission) == "table" and mission.time or nil
+    if type(spec.isMotorStarted) == "boolean" and isFinite(spec.motorStartTime) and isFinite(now) then
+        return spec.isMotorStarted and spec.motorStartTime > now, "isMotorStarted+motorStartTime"
+    end
+    return nil, nil
+end
+
+-- What a motor may consume without that making it a combustion engine.
+M.ELECTRIC_CONSUMER = "ELECTRICCHARGE"
+M.NON_FUEL_CONSUMERS = { AIR = true } -- compressed air for the brakes
+
+--- Fill type names of everything the vehicle's motor consumes, upper case
+-- and sorted. @return list (possibly empty), source; or nil when unknown
+function M.getConsumerNames(vehicle)
+    local spec = vehicle.spec_motorized
+    if type(spec) ~= "table" then
+        return nil, nil
+    end
+
+    local names = {}
+    local byName = spec.consumersByFillTypeName
+    if type(byName) == "table" then
+        for name in pairs(byName) do
+            if type(name) == "string" then
+                names[#names + 1] = string.upper(name)
+            end
+        end
+        table.sort(names)
+        return names, "consumersByFillTypeName"
+    end
+
+    local list = spec.consumers
+    local manager = g_fillTypeManager
+    if type(list) == "table" and manager ~= nil and isFunc(manager.getFillTypeNameByIndex) then
+        for _, consumer in pairs(list) do
+            if type(consumer) == "table" and consumer.fillType ~= nil then
+                local name = manager:getFillTypeNameByIndex(consumer.fillType)
+                if type(name) ~= "string" then
+                    return nil, nil -- a consumer that cannot be named: do not guess
+                end
+                names[#names + 1] = string.upper(name)
+            end
+        end
+        table.sort(names)
+        return names, "consumers+getFillTypeNameByIndex"
+    end
+    return nil, nil
+end
+
+--- Is the vehicle driven by an electric motor, with no combustion engine?
+-- The game has no flag for this; what tells the drives apart is what the
+-- motor consumes. Electric: it consumes ELECTRICCHARGE and nothing else that
+-- could be a fuel. Diesel, methane, DEF or a fuel this script does not know
+-- next to the charge (a hybrid, a mod's own fuel) all mean "not electric",
+-- so that a wrong guess errs towards an engine being there.
+-- @return true/false, or nil when what the motor consumes is unknown; source
+function M.isElectric(vehicle)
+    local names, source = M.getConsumerNames(vehicle)
+    if names == nil then
+        return nil, nil
+    end
+    local hasCharge, hasOther = false, false
+    for i = 1, #names do
+        if names[i] == M.ELECTRIC_CONSUMER then
+            hasCharge = true
+        elseif not M.NON_FUEL_CONSUMERS[names[i]] then
+            hasOther = true
+        end
+    end
+    local listed = (#names > 0) and table.concat(names, ",") or "no consumers"
+    return hasCharge and not hasOther, string.format("%s (%s)", tostring(source), listed)
+end
+
+-- What is worked out once per driven vehicle and kept while it is driven:
+-- whether it is electric, and which wheels are watched for bumps (with their
+-- running state). Driving another vehicle, or none, starts afresh.
+local driveCache = { vehicle = nil }
+
+function M.resetVehicleCache()
+    driveCache = { vehicle = nil }
+end
+
+local function cacheFor(vehicle)
+    if driveCache.vehicle ~= vehicle then
+        driveCache = { vehicle = vehicle }
+    end
+    return driveCache
+end
+
+--- isElectric, remembered per driven vehicle.
+function M.getElectric(vehicle)
+    local cache = cacheFor(vehicle)
+    if cache.electric ~= nil then
+        return cache.electric, cache.electricSource
+    end
+    local electric, source = M.isElectric(vehicle)
+    if type(electric) == "boolean" then
+        cache.electric, cache.electricSource = electric, source
+    end
+    return electric, source
+end
+
+--- getRpmRange, remembered per driven vehicle.
+function M.getRpmRangeCached(vehicle)
+    local cache = cacheFor(vehicle)
+    if cache.rpmMin ~= nil then
+        return cache.rpmMin, cache.rpmMax, cache.rpmSource
+    end
+    local low, high, source = M.getRpmRange(vehicle)
+    if low ~= nil then
+        cache.rpmMin, cache.rpmMax, cache.rpmSource = low, high, source
+    end
+    return low, high, source
+end
+
+---------------------------------------------------------------------------
+-- bumps
+---------------------------------------------------------------------------
+
+--- Where a wheel sits in the vehicle: x (positive = left), z (positive = front).
+local function wheelPosition(vehicle, wheel, physics)
+    local root = vehicle.rootNode
+    local node = wheel.repr or wheel.driveNode
+    if isFunc(localToLocal) and root ~= nil and node ~= nil then
+        local ok, x, _, z = pcall(localToLocal, node, root, 0, 0, 0)
+        if ok and isFinite(x) and isFinite(z) then
+            return x, z
+        end
+    end
+    if isFinite(physics.positionX) and isFinite(physics.positionZ) then
+        return physics.positionX, physics.positionZ
+    end
+    return nil, nil
+end
+
+--- Does the steering turn this wheel? (Wheels that only follow, like those
+-- of a steering-axle trailer, do not count.)
+local function isSteeredWheel(physics)
+    if isFinite(physics.rotMax) and physics.rotMax ~= 0 then
+        return true
+    end
+    if isFinite(physics.rotMin) and physics.rotMin ~= 0 then
+        return true
+    end
+    return isFinite(physics.rotSpeed) and physics.rotSpeed ~= 0
+end
+
+--- The wheels to watch for bumps: the steered wheels of the front-most
+-- steered axle, each on its side. A vehicle without steered wheels (it bends
+-- in the middle, or runs on tracks) gives the wheels of its front-most axle.
+-- @return list of { wheel, physics, left, right }, description; or nil
+function M.findBumpWheels(vehicle)
+    local wheelSpec = vehicle.spec_wheels
+    local wheels = type(wheelSpec) == "table" and wheelSpec.wheels or nil
+    if type(wheels) ~= "table" then
+        return nil, nil
+    end
+
+    local all, steered = {}, {}
+    for _, wheel in pairs(wheels) do
+        local physics = type(wheel) == "table" and wheel.physics or nil
+        if type(physics) == "table" then
+            local entry = { wheel = wheel, physics = physics }
+            entry.x, entry.z = wheelPosition(vehicle, wheel, physics)
+            all[#all + 1] = entry
+            if isSteeredWheel(physics) then
+                steered[#steered + 1] = entry
+            end
+        end
+    end
+
+    local pool, rule, anySteered = steered, "steered wheels", true
+    if #pool == 0 then
+        pool, rule, anySteered = all, "front axle (no steered wheels)", false
+    end
+
+    -- keep the front-most axle of the pool
+    local frontZ = nil
+    for i = 1, #pool do
+        local z = pool[i].z
+        if z ~= nil and (frontZ == nil or z > frontZ) then
+            frontZ = z
+        end
+    end
+    local chosen = {}
+    for i = 1, #pool do
+        local entry = pool[i]
+        if frontZ == nil or (entry.z ~= nil and entry.z >= frontZ - M.BUMP_AXLE_DEPTH) then
+            if entry.x ~= nil then
+                entry.left = entry.x > -M.BUMP_CENTRE_WIDTH
+                entry.right = entry.x < M.BUMP_CENTRE_WIDTH
+            elseif type(entry.wheel.isLeft) == "boolean" then
+                entry.left, entry.right = entry.wheel.isLeft, not entry.wheel.isLeft
+            end
+            if entry.left or entry.right then
+                chosen[#chosen + 1] = entry
+            end
+        end
+    end
+    if frontZ == nil and not anySteered then
+        return nil, nil -- no steered wheels and no positions: "front" cannot be told
+    end
+    if #chosen == 0 then
+        return nil, nil
+    end
+
+    local left, right = 0, 0
+    for i = 1, #chosen do
+        if chosen[i].left then left = left + 1 end
+        if chosen[i].right then right = right + 1 end
+    end
+    return chosen, string.format("%s (%d left, %d right)", rule, left, right)
+end
+
+--- The wheel's tire load, in any unit as long as it is always the same one.
+-- @return load (0 when off the ground), or nil when it cannot be read
+local function wheelLoad(entry)
+    local physics = entry.physics
+    if isFunc(physics.getTireLoad) then
+        local ok, load = pcall(physics.getTireLoad, physics)
+        if ok and isFinite(load) then
+            return math.abs(load)
+        end
+    end
+    if isFunc(getWheelShapeContactForce) and entry.wheel.node ~= nil and physics.wheelShape ~= nil
+        and physics.wheelShapeCreated ~= false then
+        local ok, force = pcall(getWheelShapeContactForce, entry.wheel.node, physics.wheelShape)
+        if ok then
+            if force == nil then
+                return 0 -- no contact
+            elseif isFinite(force) then
+                return math.abs(force)
+            end
+        end
+    end
+    return nil
+end
+
+local function wheelSuspension(entry)
+    local netInfo = entry.physics.netInfo
+    if type(netInfo) == "table" and isFinite(netInfo.suspensionLength) then
+        return netInfo.suspensionLength
+    end
+    return nil
+end
+
+--- Build (once per driven vehicle) what updateBumps works on.
+-- @return state table, or false when this vehicle gives nothing to go on
+local function bumpStateFor(vehicle)
+    local cache = cacheFor(vehicle)
+    if cache.bump ~= nil then
+        return cache.bump
+    end
+    cache.bump = false
+
+    -- The physics values exist where the simulation runs: single player and
+    -- the host. A multiplayer client only gets a coarse, delayed copy of the
+    -- suspension and no tire load at all, so there the keys are left out.
+    if vehicle.isServer == false then
+        cache.bumpSource = "none (multiplayer client: wheel physics is not local)"
+        return false
+    end
+
+    local entries, description = M.findBumpWheels(vehicle)
+    if entries == nil then
+        cache.bumpSource = "none (no usable wheels)"
+        return false
+    end
+
+    local signal = nil
+    for i = 1, #entries do
+        if wheelLoad(entries[i]) == nil then
+            signal = nil
+            break
+        end
+        signal = "load"
+    end
+    if signal == nil then
+        for i = 1, #entries do
+            if wheelSuspension(entries[i]) == nil then
+                signal = nil
+                break
+            end
+            signal = "suspension"
+        end
+    end
+    if signal == nil then
+        cache.bumpSource = "none (neither tire load nor suspension length can be read)"
+        return false
+    end
+
+    local hasLeft, hasRight = false, false
+    for i = 1, #entries do
+        hasLeft = hasLeft or entries[i].left == true
+        hasRight = hasRight or entries[i].right == true
+    end
+    cache.bump = {
+        entries = entries,
+        signal = signal,
+        hasLeft = hasLeft,
+        hasRight = hasRight,
+        left = { peak = 0, age = 0, value = 0 },
+        right = { peak = 0, age = 0, value = 0 },
+    }
+    cache.bumpSource = string.format("%s of the %s",
+        signal == "load" and "tire load against its running average" or "suspension speed", description)
+    return cache.bump
+end
+
+--- How hard one wheel is being jolted this frame.
+-- @return jolt 0..1, the raw measurement behind it (load ratio, or m/s)
+local function wheelJolt(state, entry, dt)
+    if state.signal == "load" then
+        local load = wheelLoad(entry)
+        if load == nil or load <= 0 then
+            return 0, 0 -- unreadable this frame, or off the ground
+        end
+        entry.warmMs = (entry.warmMs or 0) + dt
+        if entry.average == nil then
+            entry.average, entry.highest = load, load
+            return 0, 1
+        end
+        -- a wheel carrying next to nothing must not turn a touch into a hit
+        local reference = math.max(entry.average, 0.3 * entry.highest, 1e-9)
+        local ratio = load / reference
+        -- the average follows slowly, and a spike does not drag it along
+        local weight = dt / (M.BUMP_BASELINE_MS + dt)
+        entry.average = entry.average + (math.min(load, reference * 1.5) - entry.average) * weight
+        if entry.average > entry.highest then
+            entry.highest = entry.average
+        end
+        if entry.warmMs < M.BUMP_WARMUP_MS then
+            return 0, ratio
+        end
+        return clamp((ratio - M.BUMP_LOAD_START) / (M.BUMP_LOAD_FULL - M.BUMP_LOAD_START), 0, 1), ratio
+    end
+
+    local length = wheelSuspension(entry)
+    if length == nil then
+        return 0, 0
+    end
+    local last = entry.lastLength
+    entry.lastLength = length
+    if last == nil or dt <= 0 then
+        return 0, 0
+    end
+    local speed = math.abs(length - last) / (dt / 1000)
+    return clamp((speed - M.BUMP_SUSP_START) / (M.BUMP_SUSP_FULL - M.BUMP_SUSP_START), 0, 1), speed
+end
+
+local function holdPeak(side, jolt, dt)
+    side.age = side.age + dt
+    local held = side.peak * math.max(0, 1 - side.age / M.BUMP_HOLD_MS)
+    if jolt > 0 and jolt >= held then
+        side.peak, side.age, held = jolt, 0, jolt
+    elseif held <= 0 then
+        side.peak, held = 0, 0
+    end
+    side.value = held
+end
+
+-- One-time calibration notes for the game log (per savegame load).
+local bumpNotes = nil
+
+function M.resetBumpNotes()
+    bumpNotes = {
+        strong = false,
+        field = { ms = 0, left = 0, right = 0, done = false },
+        other = { ms = 0, left = 0, right = 0, done = false },
+    }
+end
+M.resetBumpNotes()
+
+local function bumpScale(state)
+    if state.signal == "load" then
+        return string.format("tire load as a multiple of its running average; a bump counts from %s, full at %s",
+            M.fmtFixed(M.BUMP_LOAD_START, 2), M.fmtFixed(M.BUMP_LOAD_FULL, 2))
+    end
+    return string.format("suspension speed in m/s; a bump counts from %s, full at %s",
+        M.fmtFixed(M.BUMP_SUSP_START, 2), M.fmtFixed(M.BUMP_SUSP_FULL, 2))
+end
+
+--- Advance the bump detection by one frame. Call every frame while driving.
+-- @param dt      frame time in ms (real time)
+-- @param onField whether the vehicle is on a field (only for the notes)
+-- @return a line for the game log on the few occasions there is one, else nil
+function M.updateBumps(vehicle, dt, onField)
+    if type(vehicle) ~= "table" then
+        return nil
+    end
+    local state = bumpStateFor(vehicle)
+    if not state then
+        return nil
+    end
+    if not isFinite(dt) or dt < 0 then
+        dt = 0
+    end
+
+    local speed = M.getSpeed(vehicle)
+    local absSpeed = isFinite(speed) and math.abs(speed) or 0
+    local moving = absSpeed >= M.BUMP_MIN_SPEED
+    local hitch = dt > M.BUMP_GAP_MS
+
+    local joltLeft, joltRight, rawLeft, rawRight = 0, 0, 0, 0
+    for i = 1, #state.entries do
+        local entry = state.entries[i]
+        local jolt, raw = wheelJolt(state, entry, hitch and 0 or dt)
+        if entry.left then
+            joltLeft, rawLeft = math.max(joltLeft, jolt), math.max(rawLeft, raw)
+        end
+        if entry.right then
+            joltRight, rawRight = math.max(joltRight, jolt), math.max(rawRight, raw)
+        end
+    end
+    if not moving or hitch then
+        -- standing still the chassis rocks without anything being hit, and
+        -- after a hitch the change since the last frame says nothing
+        joltLeft, joltRight = 0, 0
+    end
+    holdPeak(state.left, joltLeft, dt)
+    holdPeak(state.right, joltRight, dt)
+
+    -- notes for the first run in the game
+    if not moving or hitch then
+        return nil
+    end
+    local notes = bumpNotes
+    if not notes.strong and math.max(joltLeft, joltRight) >= M.BUMP_NOTE_STRONG then
+        notes.strong = true
+        local left = joltLeft >= joltRight
+        return string.format("first strong bump: %s wheel %s at %s m/s, measured %s (%s)",
+            left and "left" or "right", M.fmtFixed(left and joltLeft or joltRight, 2), M.fmtFixed(absSpeed, 1),
+            M.fmtFixed(left and rawLeft or rawRight, 2), bumpScale(state))
+    end
+    local stats = (onField == true) and notes.field or notes.other
+    if not stats.done then
+        stats.ms = stats.ms + dt
+        stats.left, stats.right = math.max(stats.left, rawLeft), math.max(stats.right, rawRight)
+        if stats.ms >= M.BUMP_NOTE_AFTER_MS then
+            stats.done = true
+            return string.format("bump check after %d s of driving %s: highest left %s, right %s (%s)",
+                math.floor(M.BUMP_NOTE_AFTER_MS / 1000 + 0.5), (onField == true) and "on a field" or "off the fields",
+                M.fmtFixed(stats.left, 2), M.fmtFixed(stats.right, 2), bumpScale(state))
+        end
+    end
+    return nil
+end
+
+--- The held bump values, left and right from the driver's seat.
+-- @return bumpl, bumpr (each nil when there is nothing to measure it with), source
+function M.getBumps(vehicle)
+    local state = bumpStateFor(vehicle)
+    local source = cacheFor(vehicle).bumpSource
+    if not state then
+        return nil, nil, source
+    end
+    local left = state.hasLeft and state.left.value or nil
+    local right = state.hasRight and state.right.value or nil
+    -- with the driving position turned round, the driver's left is the vehicle's right
+    local reverse = vehicle.spec_reverseDriving
+    if type(reverse) == "table" and reverse.isReverseDriving == true then
+        left, right = right, left
+    end
+    return left, right, source
 end
 
 --- The wheels the engine drives, from the differentials.
@@ -663,27 +1266,37 @@ end
 
 local fieldRoughCacheFor, fieldRoughCache = nil, nil
 
+local fieldSurfaceCache = nil
+
+--- @return roughness by field ground state, kind of surface by field ground state
 local function fieldRoughTable()
     local types = FieldGroundType
     if type(types) ~= "table" and type(types) ~= "userdata" then
-        return nil
+        return nil, nil
     end
     if fieldRoughCacheFor ~= types then
-        local cache = {}
+        local cache, kinds = {}, {}
         for name, rough in pairs(M.FIELD_ROUGH_BY_NAME) do
             local ok, value = pcall(function() return types[name] end)
             if ok and value ~= nil then
                 cache[value] = rough
             end
         end
-        fieldRoughCacheFor, fieldRoughCache = types, cache
+        for name, kind in pairs(M.FIELD_SURFACE_BY_NAME) do
+            local ok, value = pcall(function() return types[name] end)
+            if ok and value ~= nil then
+                kinds[value] = kind
+            end
+        end
+        fieldRoughCacheFor, fieldRoughCache, fieldSurfaceCache = types, cache, kinds
     end
-    return fieldRoughCache
+    return fieldRoughCache, fieldSurfaceCache
 end
 
---- Roughness under one wheel.
+--- Roughness and kind of surface under one wheel.
 -- @param physics the wheel's WheelPhysics object (wheel.physics in FS25)
--- @return rough 0..1 or nil when the wheel is in the air / unknown, isField
+-- @return rough 0..1 or nil when the wheel is in the air / unknown, isField,
+--         kind (a M.SURFACE value, nil along with rough)
 function M.classifyWheel(physics)
     if type(physics) ~= "table" then
         return nil, false
@@ -696,9 +1309,12 @@ function M.classifyWheel(physics)
             return nil, false
         elseif contact == contactTypes.OBJECT then
             -- on a road mesh, bridge, yard slab ... the game plays "asphalt" here
-            return M.ROUGH.ROAD, false
+            return M.ROUGH.ROAD, false, M.SURFACE.ROAD
         elseif contact == contactTypes.GROUND_HEIGHT then
-            return (physics.hasSnowContact == true) and M.ROUGH.SNOW or M.ROUGH.HEAP, false
+            if physics.hasSnowContact == true then
+                return M.ROUGH.SNOW, false, M.SURFACE.SNOW
+            end
+            return M.ROUGH.HEAP, false, M.SURFACE.HEAP
         end
         -- otherwise WheelContactType.GROUND: terrain, classified below
     elseif physics.hasGroundContact == false then
@@ -709,10 +1325,11 @@ function M.classifyWheel(physics)
     local densityType = physics.densityType
     if groundTypes ~= nil and densityType ~= nil and densityType ~= groundTypes.NONE then
         if densityType == groundTypes.GRASS or densityType == groundTypes.GRASS_CUT then
-            return M.ROUGH.GRASS, false
+            return M.ROUGH.GRASS, false, M.SURFACE.GRASS
         end
-        local known = fieldRoughTable()
-        return (known ~= nil and known[densityType]) or M.ROUGH.FIELD, true
+        local known, kinds = fieldRoughTable()
+        return (known ~= nil and known[densityType]) or M.ROUGH.FIELD, true,
+            (kinds ~= nil and kinds[densityType]) or M.SURFACE.FIELD
     end
 
     -- Plain terrain: use the layer's "depth" attribute with the game's own
@@ -720,50 +1337,67 @@ function M.classifyWheel(physics)
     local depth = physics.groundDepth
     if isFinite(depth) then
         if depth < M.DEPTH_ROAD then
-            return M.ROUGH.ROAD, false
+            return M.ROUGH.ROAD, false, M.SURFACE.ROAD
         elseif depth > M.DEPTH_SOFT then
-            return M.ROUGH.GRASS, false
+            return M.ROUGH.GRASS, false, M.SURFACE.GRASS
         end
         local span = M.DEPTH_SOFT - M.DEPTH_ROAD
-        return M.ROUGH.DIRT_ROAD + (depth - M.DEPTH_ROAD) / span * 0.15, false
+        return M.ROUGH.DIRT_ROAD + (depth - M.DEPTH_ROAD) / span * 0.15, false, M.SURFACE.GRAVEL
     end
-    return nil, false
+    return nil, false, nil
 end
 
---- Surface under the vehicle: rough 0..1 and field 0/1.
+--- Surface under the vehicle: rough 0..1, field 0/1, and the kind of surface
+-- most of the wheels are on (a M.SURFACE value, or nil when unknown).
+-- @return rough, field, source, kind
 function M.getSurface(vehicle)
     local wheelSpec = vehicle.spec_wheels
     local wheels = type(wheelSpec) == "table" and wheelSpec.wheels or nil
 
     local sum, count, onField = 0, 0, 0
+    local wheelsOn, roughOn = {}, {}
     if type(wheels) == "table" then
         for _, wheel in pairs(wheels) do
             if type(wheel) == "table" then
-                local rough, isField = M.classifyWheel(wheel.physics)
+                local rough, isField, kind = M.classifyWheel(wheel.physics)
                 if rough ~= nil then
                     sum = sum + rough
                     count = count + 1
                     if isField then
                         onField = onField + 1
                     end
+                    if kind ~= nil then
+                        wheelsOn[kind] = (wheelsOn[kind] or 0) + 1
+                        roughOn[kind] = (roughOn[kind] or 0) + rough
+                    end
                 end
             end
         end
     end
     if count > 0 then
-        return sum / count, (onField * 2 >= count), string.format("wheel.physics (%d wheels in contact)", count)
+        -- The kind most wheels stand on; when it is even, the rougher one, which is the one felt.
+        -- Walked in number order so that the answer does not depend on table order.
+        local best = nil
+        for kind = 1, M.SURFACE_COUNT do
+            local n = wheelsOn[kind]
+            if n ~= nil and (best == nil or n > wheelsOn[best]
+                or (n == wheelsOn[best] and roughOn[kind] >= roughOn[best])) then
+                best = kind
+            end
+        end
+        return sum / count, (onField * 2 >= count), string.format("wheel.physics (%d wheels in contact)", count), best
     end
 
     -- No usable wheel data: all we can ask is whether the vehicle is on a field.
     if isFunc(vehicle.getIsOnField) then
         local isOnField = vehicle:getIsOnField()
         if isOnField == true then
-            return M.ROUGH.FIELD, true, "getIsOnField"
+            return M.ROUGH.FIELD, true, "getIsOnField", M.SURFACE.FIELD
         elseif isOnField == false then
-            return nil, false, "getIsOnField"
+            return nil, false, "getIsOnField", nil
         end
     end
-    return nil, nil, nil
+    return nil, nil, nil, nil
 end
 
 local function hasOwnLoweredState(object)
@@ -895,6 +1529,7 @@ function M.gather(vehicle)
     local sample = { active = false }
     local info = { sources = {}, errors = {} }
     if type(vehicle) ~= "table" then
+        M.resetVehicleCache() -- nobody is driving: nothing to remember
         return sample, info
     end
     sample.active = true
@@ -940,6 +1575,38 @@ function M.gather(vehicle)
         info.sources.engine = source
     end)
 
+    try("rpmrange", function()
+        local low, high, source = M.getRpmRangeCached(vehicle)
+        if isFinite(low) and isFinite(high) then
+            sample.rpmmin, sample.rpmmax = low, high
+        end
+        info.sources.rpmrange = source
+    end)
+
+    local electric = nil
+    try("electric", function()
+        local value, source = M.getElectric(vehicle)
+        if type(value) == "boolean" then
+            electric = value
+            sample.electric = value
+        end
+        info.sources.electric = source
+    end)
+
+    try("starting", function()
+        if electric == true then
+            -- by contract never 1 for an electric vehicle, whatever its motor state
+            sample.starting = false
+            info.sources.starting = "electric: never"
+            return
+        end
+        local value, source = M.getStarting(vehicle)
+        if type(value) == "boolean" then
+            sample.starting = value
+        end
+        info.sources.starting = source
+    end)
+
     try("slip", function()
         local slip, source = M.getSlip(vehicle, sample.speed)
         if isFinite(slip) then
@@ -949,8 +1616,9 @@ function M.gather(vehicle)
     end)
 
     try("surface", function()
-        local rough, field, source = M.getSurface(vehicle)
+        local rough, field, source, kind = M.getSurface(vehicle)
         if isFinite(rough) then sample.rough = rough end
+        if isFinite(kind) then sample.surface = kind end
         if type(field) == "boolean" then sample.field = field end
         info.sources.surface = source
     end)
@@ -960,6 +1628,13 @@ function M.gather(vehicle)
         sample.lowered = lowered
         sample.working = working
         info.sources.implements = string.format("%d attached", count)
+    end)
+
+    try("bumps", function()
+        local left, right, source = M.getBumps(vehicle)
+        if isFinite(left) then sample.bumpl = left end
+        if isFinite(right) then sample.bumpr = right end
+        info.sources.bumps = source
     end)
 
     return sample, info

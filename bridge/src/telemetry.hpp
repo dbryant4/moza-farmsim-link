@@ -8,6 +8,29 @@
 
 namespace bridge {
 
+/** What the vehicle is driving on, as far as the feel of it goes. Key `surface`, written as the number. */
+enum class Surface
+{
+    /** The mod did not say (an older mod, or wheels in the air). Never written. */
+    Unknown = 0,
+    /** Asphalt, concrete, bridges, yard slabs. */
+    Road,
+    /** Gravel and dirt tracks: hard ground that is not paved. */
+    Gravel,
+    Grass,
+    Snow,
+    /** A heap of tipped material. */
+    Heap,
+    /** A field with a settled surface: sown, rolled, a seedbed, stubble left standing. */
+    Field,
+    /** A field broken up into clods: ploughed or cultivated. */
+    Tilled,
+    /** A field laid up in ridges. */
+    Ridge,
+};
+
+constexpr int kSurfaceCount = 9;
+
 /**
  * One sample of the file the FS25 mod rewrites. Keys, units and defaults are fixed by
  * docs/telemetry.md; the values are carried as written, with no range clamping.
@@ -30,16 +53,28 @@ struct Telemetry
     double rpm = 0.0;
     /** Engine load, 0..1. */
     double load = 0.0;
+    /** This vehicle's idle and maximum engine speed, 1/min; 0 when the game does not say. */
+    double rpmMin = 0.0;
+    double rpmMax = 0.0;
     /** Largest longitudinal slip among the driven wheels, 0..1. */
     double slip = 0.0;
     /** Surface roughness, 0 (asphalt) .. 1 (freshly ploughed). */
     double rough = 0.0;
+    /** What kind of ground most of the wheels are on. */
+    Surface surface = Surface::Unknown;
     /** The vehicle is on a field. */
     bool field = false;
     /** Any attached implement is lowered. */
     bool lowered = false;
     /** Any attached implement is actively working the ground. */
     bool working = false;
+    /** The engine is being started: triggered but not yet running. Never set for an electric vehicle. */
+    bool starting = false;
+    /** Driven by an electric motor, with no combustion engine. */
+    bool electric = false;
+    /** How hard the left / right steered wheel is being jolted by an obstacle right now, 0..1. */
+    double bumpLeft  = 0.0;
+    double bumpRight = 0.0;
 
     bool operator==(const Telemetry&) const = default;
 };
@@ -124,5 +159,11 @@ private:
  * followed; the path has to be given explicitly then.
  */
 std::filesystem::path defaultTelemetryPath();
+
+/**
+ * Farming Simulator 25's own folder for this user (the one holding mods, modSettings and the
+ * savegames), whether or not it exists. Empty where there is no such place.
+ */
+std::filesystem::path defaultGameFolder();
 
 } // namespace bridge

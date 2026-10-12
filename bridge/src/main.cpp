@@ -9,6 +9,7 @@
 #include "moza/private/version.h"
 
 #include <atomic>
+#include <cstdarg>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -17,6 +18,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <initializer_list>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -27,6 +31,16 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <tlhelp32.h>
+#endif
+
+#ifdef _WIN32
+#include "update_check.hpp"
+#include "updater.hpp"
+#endif
+
+#ifdef BRIDGE_TRAY
+#include "mod_sync.hpp"
+#include "tray.hpp"
 #endif
 
 #ifndef BRIDGE_VERSION
@@ -42,6 +56,49 @@ std::atomic<bool> g_cleanedUp{false};
 std::atomic<bool> g_verbose{false};
 std::atomic<int>  g_asyncErrors{0};
 std::atomic<int>  g_deviceId{-1};
+
+/** The last thing that stopped the bridge from doing its job, for the windowless build to show the user. */
+std::string       g_problem;
+std::atomic<bool> g_deviceLost{false};
+
+/** Reports why the bridge cannot carry on: to stderr, and remembered for a message box where there is no console. */
+void problem(const char* format, ...)
+{
+    char    text[600];
+    va_list arguments;
+    va_start(arguments, format);
+    std::vsnprintf(text, sizeof(text), format, arguments);
+    va_end(arguments);
+    std::fprintf(stderr, "%s\n", text);
+    g_problem = text;
+}
+
+/** Where releases are published: "owner/name" on GitHub. */
+[[maybe_unused]] constexpr const char* kRepository = "dbryant4/moza-farmsim-link";
+
+#ifdef BRIDGE_TRAY
+bridge::Tray* g_tray = nullptr;
+/** Held by the helper threads while they use g_tray, and by main while it takes the icon away. */
+std::mutex g_trayMutex;
+
+template <typename Use>
+void withTray(Use use)
+{
+    std::scoped_lock lock(g_trayMutex);
+    if (g_tray != nullptr)
+    {
+        use(*g_tray);
+    }
+}
+
+bridge::Updater*  g_updater = nullptr;
+/** Follows the "look for new versions" setting once the link has loaded its settings. */
+std::atomic<bool> g_checkUpdates{true};
+std::atomic<bool> g_updateInstallable{false};
+std::mutex        g_updateMutex;
+/** The newer release that was found, if any; guarded by g_updateMutex. */
+std::string       g_newerVersion;
+#endif
 
 std::atomic<const char*> g_shutdownStep{"starting teardown"};
 /** What the process exits with if teardown has to be cut short. */
@@ -109,6 +166,12 @@ struct Options
     int         refreshMs     = 200;
     double      seconds       = 0.0;
     double      waitSeconds   = 10.0;
+    bool        waitGiven     = false;
+    /** Tell a running windowless instance to exit, then exit. */
+    bool        quit          = false;
+    /** Ask GitHub about the latest release and exit; with fetchUpdate, also download and verify its installer. */
+    bool        checkUpdate   = false;
+    bool        fetchUpdate   = false;
     /** Axis whose spring center is swept back and forth, or -1 for a fixed center. */
     int         sweepAxis             = -1;
     double      sweepAmplitudePercent = 20.0;
@@ -144,6 +207,8 @@ void printUsage()
         "\n"
         "Test options (no game needed):\n"
         "  --list             Print devices and force feedback settings, then exit (no forces)\n"
+        "  --check-update     Ask GitHub for the latest release and print it, then exit (no yoke needed)\n"
+        "  --fetch-update     The same, and also download and verify its installer without running it\n"
         "  --hold             Hold a fixed spring + damper (see --axis, --spring, --damper)\n"
         "  --device TEXT      Use the flight base whose name contains TEXT (default: first found)\n"
         "  --axis AXIS        roll, pitch or both (default: roll)\n"
@@ -287,7 +352,14 @@ Options parseOptions(int argc, char** argv)
         else if (arg == "--duration-ms") options.durationMs = static_cast<int>(parseNumber("--duration-ms", next(), 0, 65535));
         else if (arg == "--refresh-ms") options.refreshMs = static_cast<int>(parseNumber("--refresh-ms", next(), 10, 60000));
         else if (arg == "--seconds") options.seconds = parseNumber("--seconds", next(), 0, 86400);
-        else if (arg == "--wait") options.waitSeconds = parseNumber("--wait", next(), 0, 600);
+        else if (arg == "--wait")
+        {
+            options.waitSeconds = parseNumber("--wait", next(), 0, 600);
+            options.waitGiven   = true;
+        }
+        else if (arg == "--quit") options.quit = true;
+        else if (arg == "--check-update") options.checkUpdate = true;
+        else if (arg == "--fetch-update") options.checkUpdate = options.fetchUpdate = true;
         else usageError("Unknown option: " + arg);
     }
 
@@ -351,13 +423,15 @@ void onEvent(const MOZA_EVENT_DATA* event, void*)
     {
     case MOZA_ET_SERVICE_CONNECTION_CLOSED:
         std::fprintf(stderr, "The MOZA device service closed the connection.\n");
-        g_stop = true;
+        g_deviceLost = true;
+        g_stop       = true;
         break;
     case MOZA_ET_DEVICE_DISCONNECTED:
         if (static_cast<int>(event->data.deviceDisconnected.deviceId) == g_deviceId)
         {
             std::fprintf(stderr, "The flight base disconnected.\n");
-            g_stop = true;
+            g_deviceLost = true;
+            g_stop       = true;
         }
         break;
     case MOZA_ET_DEVICE_COMMAND_ERROR_OCCURRED:
@@ -402,6 +476,87 @@ void printDevices()
                     static_cast<unsigned>(info.type), static_cast<int>(info.state),
                     static_cast<unsigned>(info.vendorId), static_cast<unsigned>(info.productId),
                     static_cast<int>(info.hidDeviceCount));
+    }
+}
+
+/** True for the names MOZA gives lighting parameters and commands. */
+bool isLightingName(const char* name)
+{
+    for (const char* word : {"Led", "LED", "Light", "Lamp", "Rgb", "RGB", "Bright"})
+    {
+        if (std::strstr(name, word) != nullptr)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Prints, for every MOZA device, the lighting parameters it reports and their current values.
+ * What a connected device lists is the authority on what it supports; the SDK headers describe
+ * the whole product family. Read-only.
+ */
+void printLighting()
+{
+    // A handle plugged into the base turns up a moment after the base itself, so wait until the
+    // list has stopped growing rather than taking the first answer.
+    std::vector<moza::DeviceInfo> devices;
+    const auto                    deadline   = Clock::now() + std::chrono::seconds(5);
+    auto                          lastGrowth = Clock::now();
+    while (Clock::now() < deadline && Clock::now() - lastGrowth < std::chrono::milliseconds(1500))
+    {
+        auto [listErr, current] = moza::getDeviceList();
+        if (listErr == MOZA_ERR_NO_ERROR && current.size() > devices.size())
+        {
+            devices    = std::move(current);
+            lastGrowth = Clock::now();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    std::puts("Lighting each device reports:");
+    for (const auto& info : devices)
+    {
+        auto [openErr, device] = moza::Device::open(info.id);
+        if (openErr != MOZA_ERR_NO_ERROR)
+        {
+            std::printf("  %s: could not be opened (%s)\n", info.name, bridge::errnoName(openErr));
+            continue;
+        }
+
+        auto [parameterErr, parameters] = device.getParameterList();
+        auto [commandErr, commands]     = device.getCommandList();
+        int  shown                      = 0;
+        std::printf("  %s (%zu parameters, %zu commands in all)\n", info.name, parameterErr == MOZA_ERR_NO_ERROR ? parameters.size() : 0,
+                    commandErr == MOZA_ERR_NO_ERROR ? commands.size() : 0);
+        for (const auto& parameter : parameters)
+        {
+            if (!isLightingName(parameter.name))
+            {
+                continue;
+            }
+            std::string value = "write-only";
+            if (parameter.readable)
+            {
+                auto [valueErr, current] = device.parameter(parameter.id).getValueSync(300);
+                value                    = valueErr == MOZA_ERR_NO_ERROR ? bridge::formatValue(current) : bridge::errnoName(valueErr);
+            }
+            std::printf("    parameter %-5d %-46s %s%s = %s\n", static_cast<int>(parameter.id), parameter.name, parameter.readable ? "r" : "-",
+                        parameter.writable ? "w" : "-", value.c_str());
+            ++shown;
+        }
+        for (const auto& command : commands)
+        {
+            if (isLightingName(command.name))
+            {
+                std::printf("    command   %-5d %s\n", static_cast<int>(command.id), command.name);
+                ++shown;
+            }
+        }
+        if (shown == 0)
+        {
+            std::puts("    none");
+        }
     }
 }
 
@@ -523,7 +678,7 @@ void printStatus(double elapsed, const moza::as::Wheelbase& base, const moza::Hi
 
 bool isLinkMode(const Options& options)
 {
-    return !options.list && !options.hold && options.sweepAxis < 0 && options.forceAxis < 0 && options.sineAxis < 0 && options.strokeAxis < 0;
+    return !options.checkUpdate && !options.list && !options.hold && options.sweepAxis < 0 && options.forceAxis < 0 && options.sineAxis < 0 && options.strokeAxis < 0;
 }
 
 /** Folder holding this program, where its settings file lives by default. */
@@ -548,11 +703,23 @@ std::filesystem::path executableDirectory()
  * The bridge frees every effect on the base when it starts and stops them all when it exits,
  * which would cut the forces out from under a flight in progress.
  */
+#ifdef _WIN32
+std::string runningProcess(std::initializer_list<const wchar_t*> names);
+#endif
+
 std::string runningFlightSim()
 {
 #ifdef _WIN32
-    const wchar_t* const names[] = {L"X-Plane.exe", L"FlightSimulator.exe", L"FlightSimulator2024.exe", L"DCS.exe", L"Il-2.exe"};
+    return runningProcess({L"X-Plane.exe", L"FlightSimulator.exe", L"FlightSimulator2024.exe", L"DCS.exe", L"Il-2.exe"});
+#else
+    return {};
+#endif
+}
 
+#ifdef _WIN32
+/** The first of @p names that is a running program, or empty. */
+std::string runningProcess(std::initializer_list<const wchar_t*> names)
+{
     const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snapshot == INVALID_HANDLE_VALUE)
     {
@@ -576,10 +743,8 @@ std::string runningFlightSim()
     }
     CloseHandle(snapshot);
     return found;
-#else
-    return {};
-#endif
 }
+#endif
 
 int run(const Options& options)
 {
@@ -587,7 +752,10 @@ int run(const Options& options)
     printDevices();
     if (!found)
     {
-        std::fprintf(stderr, "No MOZA flight base found. Check that it is powered, connected and visible in MOZA Cockpit.\n");
+        if (!g_stop)
+        {
+            problem("No MOZA flight base found. Check that it is powered, connected and visible in MOZA Cockpit.");
+        }
         return 2;
     }
 
@@ -595,7 +763,7 @@ int run(const Options& options)
     const moza::Errno  openErr = Moza_DeviceOpen(found->id, &handle);
     if (openErr != MOZA_ERR_NO_ERROR)
     {
-        std::fprintf(stderr, "Could not open '%s': %s\n", found->name, bridge::errnoName(openErr));
+        problem("Could not open '%s': %s", found->name, bridge::errnoName(openErr));
         return 2;
     }
     moza::as::Wheelbase base(handle);
@@ -611,13 +779,14 @@ int run(const Options& options)
 
     if (options.list)
     {
+        printLighting();
         return 0;
     }
 
     auto [enableErr, ffbEnabled] = base.ctrlFfbEnable().getSync(300);
     if (enableErr == MOZA_ERR_NO_ERROR && ffbEnabled == 0)
     {
-        std::fprintf(stderr, "Force feedback is disabled on the base (Main_CtrlFfbEnable = 0). Enable it in MOZA Cockpit and retry.\n");
+        problem("Force feedback is disabled on the base (Main_CtrlFfbEnable = 0). Enable it in MOZA Cockpit and retry.");
         return 3;
     }
 
@@ -630,6 +799,35 @@ int run(const Options& options)
         link.fullScale     = options.fullScale;
         link.seconds       = options.seconds;
         link.verbose       = options.verbose;
+        link.versionText   = [] { return std::string(BRIDGE_VERSION); };
+#ifdef BRIDGE_TRAY
+        if (g_updater != nullptr)
+        {
+            link.checkForUpdates = &g_checkUpdates;
+            link.versionText     = [] {
+                std::scoped_lock lock(g_updateMutex);
+                return g_newerVersion.empty() ? std::string(BRIDGE_VERSION)
+                                              : BRIDGE_VERSION " (version " + g_newerVersion + " is out: right-click the icon by the clock)";
+            };
+        }
+        if (g_tray != nullptr)
+        {
+            link.onStarted = [](int port) {
+                if (g_updater != nullptr)
+                {
+                    // Only now, with the settings loaded, is it known whether the user wants checks at all.
+                    g_updater->start();
+                }
+                if (port > 0)
+                {
+                    g_tray->setSettingsUrl("http://127.0.0.1:" + std::to_string(port) + "/");
+                }
+                g_tray->notify("MOZA FS25 link is running", port > 0 ? "Click this icon to open the settings."
+                                                                    : "The settings page could not start; see the log.");
+            };
+            link.onStatus = [](const std::string& text) { g_tray->setStatus("MOZA FS25 link: " + text); };
+        }
+#endif
 
         const int result = bridge::runLink(base, hid, link, g_stop);
 
@@ -892,14 +1090,218 @@ int run(const Options& options)
 
 } // namespace
 
+#ifdef BRIDGE_TRAY
+const wchar_t* const kWindowTitle = L"MOZA FS25 link";
+
+std::wstring widen(const std::string& text)
+{
+    const int    length = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
+    std::wstring wide(static_cast<std::size_t>(std::max(length, 1)), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, wide.data(), length);
+    wide.resize(std::wcslen(wide.c_str()));
+    return wide;
+}
+
+/** With no console, everything printed goes to a log file beside the program, started afresh each run. */
+std::filesystem::path redirectOutputToLog()
+{
+    const std::filesystem::path path = executableDirectory() / "moza_fs_bridge.log";
+    if (FILE* fresh = _wfopen(path.c_str(), L"w"))
+    {
+        std::fclose(fresh);
+    }
+    // Both in append mode on the one file, so neither stream writes over the other.
+    _wfreopen(path.c_str(), L"a", stdout);
+    _wfreopen(path.c_str(), L"a", stderr);
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+    return path;
+}
+#endif
+
+#ifdef BRIDGE_TRAY
+/** A newer release was found: into the menu, onto the settings page, and a bubble to say so. */
+void offerUpdate(const bridge::ReleaseInfo& release, bool installable)
+{
+    const std::string version = release.version.text();
+    {
+        std::scoped_lock lock(g_updateMutex);
+        g_newerVersion = version;
+    }
+    g_updateInstallable = installable;
+    withTray([&](bridge::Tray& tray) {
+        tray.setUpdate(version, installable);
+        tray.notify("Version " + version + " is available",
+                    installable ? "Right-click this icon and pick \"Install version " + version + "\" when you are not driving."
+                                : "Right-click this icon for the download page.");
+    });
+}
+
+/**
+ * Keeps the mod in Farming Simulator's mods folder the same as the one shipped beside this
+ * program, which an update of the program cannot do while the game has the file open.
+ */
+class ModKeeper
+{
+public:
+    ModKeeper() : m_thread([this] { run(); }) {}
+    ~ModKeeper()
+    {
+        m_stop = true;
+        m_thread.join();
+    }
+
+private:
+    void run() const
+    {
+        const std::filesystem::path shipped = executableDirectory() / "FS25_MozaYokeLink.zip";
+        bridge::ModSync             last    = bridge::ModSync::UpToDate;
+        for (int attempt = 0; !m_stop && attempt < 2000; ++attempt)
+        {
+            const bool game = !runningProcess({L"FarmingSimulator2025Game.exe", L"FarmingSimulator2025.exe"}).empty();
+            const bridge::ModSync result = bridge::syncMod(shipped, bridge::defaultGameFolder(), game);
+            if (attempt == 0 || result != last)
+            {
+                std::printf("Game mod: %s.\n", bridge::describe(result));
+                if (result == bridge::ModSync::Updated)
+                {
+                    withTray([](bridge::Tray& tray) {
+                        tray.notify("Farming Simulator mod updated", "The mod in the game's mods folder now matches this version of the link.");
+                    });
+                }
+                else if (result == bridge::ModSync::GameRunning)
+                {
+                    withTray([](bridge::Tray& tray) {
+                        tray.notify("The game's mod is from another version", "It carries on working and is replaced once Farming Simulator has closed.");
+                    });
+                }
+            }
+            last = result;
+            // A failure is most likely the game still letting go of the file; anything else is final.
+            if (result != bridge::ModSync::GameRunning && !(result == bridge::ModSync::Failed && attempt < 8))
+            {
+                return;
+            }
+            for (int i = 0; i < 150 && !m_stop; ++i)
+            {
+                Sleep(100);
+            }
+        }
+    }
+
+    std::atomic<bool> m_stop{false};
+    std::thread       m_thread;
+};
+#endif
+
+/** Last stop before the process ends: in the windowless build, a failure is shown instead of printed. */
+int finish(int result)
+{
+#ifdef BRIDGE_TRAY
+    if (result != 0 || g_deviceLost)
+    {
+        const std::string text = g_deviceLost         ? "The yoke base or the MOZA device service went away, so the link has stopped."
+                                 : !g_problem.empty() ? g_problem
+                                                      : "The link stopped because of a problem. See moza_fs_bridge.log beside the program.";
+        MessageBoxW(nullptr, widen(text).c_str(), kWindowTitle, MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
+    }
+#endif
+    return result;
+}
+
 int main(int argc, char** argv)
 {
     // Unbuffered, so output still arrives in order and in full when piped (e.g. over SSH).
     std::setvbuf(stdout, nullptr, _IONBF, 0);
 
-    const Options options = parseOptions(argc, argv);
-    g_verbose             = options.verbose;
+    Options options = parseOptions(argc, argv);
+    g_verbose       = options.verbose;
     installStopHandler();
+
+#ifdef BRIDGE_TRAY
+    if (options.quit)
+    {
+        // Ask the instance that is running to release the yoke and exit.
+        if (const HANDLE quitEvent = OpenEventW(EVENT_MODIFY_STATE, FALSE, bridge::Tray::quitEventName()))
+        {
+            SetEvent(quitEvent);
+            CloseHandle(quitEvent);
+        }
+        return 0;
+    }
+    if (!isLinkMode(options))
+    {
+        MessageBoxW(nullptr, L"This is the windowless program for everyday use. The test options need moza_fs_bridge.exe, run from a terminal.",
+                    kWindowTitle, MB_OK | MB_ICONINFORMATION);
+        return 64;
+    }
+    // One at a time: a second copy would fight the first over the yoke. Starting it again just opens the settings.
+    CreateMutexW(nullptr, FALSE, L"Local\\MozaFsLinkInstance");
+    if (GetLastError() == ERROR_ALREADY_EXISTS)
+    {
+        bridge::Tray::openInBrowser("http://127.0.0.1:" + std::to_string(options.uiPort) + "/");
+        return 0;
+    }
+    if (!options.waitGiven)
+    {
+        // Started at login, this may be up before MOZA Cockpit has found the base.
+        options.waitSeconds = 60.0;
+    }
+    // Only now, as the one running instance: a second start or --quit must not wipe the first one's log.
+    const std::filesystem::path logPath = redirectOutputToLog();
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+
+    // Made before the icon and ended after it, so that the menu's entries always have something to call.
+    std::unique_ptr<bridge::Updater> updater;
+    if (const auto current = bridge::parseVersion(BRIDGE_VERSION))
+    {
+        bridge::Updater::Config updates;
+        updates.repository       = kRepository;
+        updates.current          = *current;
+        updates.installDirectory = executableDirectory();
+        updates.enabled          = [] { return g_checkUpdates.load(); };
+        updates.onAvailable      = &offerUpdate;
+        updates.onMessage        = [](const std::string& title, const std::string& text) {
+            withTray([&](bridge::Tray& tray) { tray.notify(title, text); });
+        };
+        updater   = std::make_unique<bridge::Updater>(std::move(updates));
+        g_updater = updater.get();
+    }
+
+    bridge::Tray::Config trayConfig;
+    if (updater)
+    {
+        trayConfig.checkForUpdates = [] { g_updater->checkNow(); };
+        trayConfig.installUpdate   = [] { g_updateInstallable ? g_updater->installNow() : g_updater->openReleasePage(); };
+        trayConfig.showUpdateNotes = [] { g_updater->openReleasePage(); };
+    }
+    trayConfig.logPath        = logPath.wstring();
+    trayConfig.requestExit    = [] { g_stop = true; };
+    trayConfig.waitForCleanup = [] {
+        for (int i = 0; i < 400 && !g_cleanedUp; ++i)
+        {
+            Sleep(10);
+        }
+    };
+    auto tray = std::make_unique<bridge::Tray>(std::move(trayConfig));
+    g_tray    = tray.get();
+    tray->setStatus("MOZA FS25 link: looking for the yoke");
+#else
+    if (options.quit)
+    {
+        std::puts("--quit is for the windowless program, moza_fs_link.exe; this one stops with Ctrl+C.");
+        return 0;
+    }
+    if (options.checkUpdate)
+    {
+#ifdef _WIN32
+        // Nothing here touches the yoke or the MOZA SDK.
+        return bridge::printUpdateCheck(kRepository, bridge::parseVersion(BRIDGE_VERSION).value_or(bridge::Version{}), options.fetchUpdate);
+#else
+        std::puts("Updates are only looked for on Windows.");
+        return 64;
+#endif
+    }
+#endif
 
     if (options.durationMs != 0 && options.refreshMs >= options.durationMs)
     {
@@ -913,35 +1315,56 @@ int main(int argc, char** argv)
         const std::string flightSim = runningFlightSim();
         if (!flightSim.empty())
         {
-            std::fprintf(stderr,
-                         "%s is running. The bridge resets the yoke's force effects when it starts, which would cut out that\n"
-                         "simulator's forces, so it is not touching the yoke. Close the simulator first, or pass --allow-flight-sim.\n",
-                         flightSim.c_str());
+            problem("%s is running. The bridge resets the yoke's force effects when it starts, which would cut out that "
+                    "simulator's forces, so it is not touching the yoke. Close the simulator first, or pass --allow-flight-sim.",
+                    flightSim.c_str());
             g_cleanedUp = true;
-            return 5;
+            return finish(5);
         }
     }
 
     Moza_SetLogCallback(onLog, nullptr);
 
-    std::printf("moza_fs_bridge %s, MOZA SDK %s (built against %s)\n", BRIDGE_VERSION, moza::getSdkVersionString(),
+#ifdef BRIDGE_TRAY
+    const char* const program = "moza_fs_link";
+#else
+    const char* const program = "moza_fs_bridge";
+#endif
+    std::printf("%s %s, MOZA SDK %s (built against %s)\n", program, BRIDGE_VERSION, moza::getSdkVersionString(),
                 MOZA_SDK_VERSION_STRING);
 
     const moza::Errno initErr = moza::initialize();
     if (initErr != MOZA_ERR_NO_ERROR)
     {
-        std::fprintf(stderr, "MOZA SDK initialization failed: %s\n", bridge::errnoName(initErr));
-        if (initErr == MOZA_ERR_SERVICE_NOT_FOUND || initErr == MOZA_ERR_SERVICE_VERSION_MISMATCH)
-        {
-            std::fprintf(stderr, "The SDK talks to the background device service installed with MOZA Cockpit / Pit House; "
-                                 "make sure it is installed, running and up to date.\n");
-        }
+        const bool service = initErr == MOZA_ERR_SERVICE_NOT_FOUND || initErr == MOZA_ERR_SERVICE_VERSION_MISMATCH;
+        problem("MOZA SDK initialization failed: %s.%s", bridge::errnoName(initErr),
+                service ? " The SDK talks to the background device service installed with MOZA Cockpit / Pit House; make sure it is "
+                          "installed, running and up to date."
+                        : "");
         g_cleanedUp = true;
-        return 1;
+        return finish(1);
     }
     Moza_SetEventCallback(onEvent, nullptr);
 
+#ifdef BRIDGE_TRAY
+    auto modKeeper = std::make_unique<ModKeeper>();
+#endif
+
     const int result = run(options);
+
+#ifdef BRIDGE_TRAY
+    modKeeper.reset();
+    if (updater)
+    {
+        updater->stop();
+    }
+    // The icon goes as soon as the yoke is released, not after the SDK's slow teardown.
+    {
+        std::scoped_lock lock(g_trayMutex);
+        g_tray = nullptr;
+    }
+    tray.reset();
+#endif
 
     // Forces are released and the device is closed by now, so a stall past this point is the SDK's
     // own teardown and does not change the outcome of the run.
@@ -951,5 +1374,5 @@ int main(int argc, char** argv)
     moza::shutdown();
     shutdownStep("exiting");
     g_cleanedUp = true;
-    return result;
+    return finish(result);
 }

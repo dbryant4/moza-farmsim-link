@@ -5,7 +5,9 @@
 #include "link.hpp"
 #include "presence.hpp"
 #include "stroke.hpp"
+#include "yoke_lights.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -28,6 +30,11 @@ int g_failures = 0;
             ++g_failures;                                                          \
         }                                                                          \
     } while (false)
+
+bool near(double a, double b, double tolerance = 1e-9)
+{
+    return std::abs(a - b) <= tolerance;
+}
 
 std::string describe(const Command& command)
 {
@@ -356,6 +363,62 @@ void testDeviceForcesScaleAndRoute()
     CHECK(forces.rollSpring == 2500);
     CHECK(forces.pull == 1000);
     CHECK(forces.rumble == 500);
+
+    // The ground's texture scales the rumble and nothing else; a value that is not a number leaves it alone.
+    output.rumbleTexture = 0.4;
+    forces               = bridge::toDeviceForces(output, tuning);
+    CHECK(forces.rumble == 200);
+    CHECK(forces.rollSpring == 2500);
+    CHECK(forces.pull == 1000);
+    output.rumbleTexture = std::nan("");
+    CHECK(bridge::toDeviceForces(output, tuning).rumble == 500);
+    output.rumbleTexture = 7.0;
+    CHECK(bridge::toDeviceForces(output, tuning).rumble == 500);
+    output.rumbleTexture = 1.0;
+
+    // A kick rides on top of the steady pull, in the same direction convention, within the device's range.
+    tuning          = bridge::LinkTuning{};
+    tuning.fullScale = 10000;
+    output.rollKick = 0.5;
+    CHECK(bridge::toDeviceForces(output, tuning).pull == -7000);
+    output.rollKick = -0.5;
+    CHECK(bridge::toDeviceForces(output, tuning).pull == 3000);
+    output.rollKick = 5.0;
+    CHECK(bridge::toDeviceForces(output, tuning).pull == -10000);
+    output.rollKick = 0.0;
+
+    // A bump on both wheels becomes two slow sines, one per axis, scaled like everything else.
+    output.pitchThump = 0.6;
+    output.rollWiggle = 0.2;
+    output.bumpHz     = 8.0;
+    forces            = bridge::toDeviceForces(output, tuning);
+    CHECK(forces.thump == 6000 && forces.wiggle == 2000 && forces.bumpPeriodMs == 125);
+    tuning.strength = 0.0;
+    forces          = bridge::toDeviceForces(output, tuning);
+    CHECK(forces.thump == 0 && forces.wiggle == 0);
+    output.bumpHz = 0.0;
+    CHECK(bridge::toDeviceForces(output, tuning).bumpPeriodMs >= 5);
+
+    // The acceleration sway: the pitch spring is re-centered on the target (a position, so strength does
+    // not scale it), and the controller's push goes out with the base's sign, where positive lowers the position.
+    tuning             = bridge::LinkTuning{};
+    tuning.fullScale   = 10000;
+    output.pitchTarget = 0.12;
+    forces             = bridge::toDeviceForces(output, tuning, 0.5);
+    CHECK(forces.pitchCenter == 1200);
+    CHECK(forces.pitchPush == -5000);
+    CHECK(near(bridge::pitchTargetFor(output, tuning), 0.12));
+    tuning.flipSway = true;
+    CHECK(bridge::toDeviceForces(output, tuning, 0.0).pitchCenter == -1200);
+    CHECK(near(bridge::pitchTargetFor(output, tuning), -0.12));
+    tuning.flipSway = false;
+    tuning.strength = 0.5;
+    forces          = bridge::toDeviceForces(output, tuning, -0.5);
+    CHECK(forces.pitchCenter == 1200 && forces.pitchPush == 2500);
+    tuning.strength = 0.0;
+    CHECK(bridge::toDeviceForces(output, tuning, 1.0).pitchPush == 0);
+    CHECK(bridge::toDeviceForces(output, tuning, std::nan("")).pitchPush == 0);
+    output.pitchTarget = 0.0;
 }
 
 void testDeviceForcesAreZeroWhenForcesAreOff()
@@ -472,6 +535,241 @@ void testPresenceFileStaysQuietWithoutTheModsFolder()
     CHECK(nowhere.path().empty());
 }
 
+void testLightsFollowEachMachinesOwnEngineRange()
+{
+    bridge::LightTuning tuning;
+    tuning.followEngine = true;
+    tuning.low          = 3.0;
+    tuning.idleRpm      = 900.0;
+    tuning.fullRpm      = 2200.0;
+    tuning.colorShift   = true;
+    tuning.colorFrom    = 0.6;
+
+    bridge::Telemetry driving;
+    driving.seq    = 1;
+    driving.active = true;
+
+    // Engine off: dark. Starting and idling: the low setting, in the user's own colour.
+    driving.rpm = 0.0;
+    CHECK(bridge::lightTargetFor(&driving, tuning).level == 0.0);
+    driving.starting = true;
+    CHECK(bridge::lightTargetFor(&driving, tuning).level == 3.0 && bridge::lightTargetFor(&driving, tuning).heat == 0.0);
+    driving.starting = false;
+
+    // A big tractor: idles at 850, flat out at 1900.
+    driving.rpmMin = 850.0;
+    driving.rpmMax = 1900.0;
+    driving.rpm    = 850.0;
+    CHECK(bridge::lightTargetFor(&driving, tuning).level == 3.0);
+    driving.rpm = 1375.0; // half way
+    CHECK(near(bridge::lightTargetFor(&driving, tuning).level, 9.0, 1e-9));
+    CHECK(bridge::lightTargetFor(&driving, tuning).heat == 0.0);
+    driving.rpm = 1900.0;
+    CHECK(bridge::lightTargetFor(&driving, tuning).level == 15.0);
+    CHECK(near(bridge::lightTargetFor(&driving, tuning).heat, 1.0, 1e-9));
+
+    // A small loader that revs to 3000: at 1900 it is not yet at full brightness, nor into the colour shift.
+    driving.rpmMin = 1000.0;
+    driving.rpmMax = 3000.0;
+    driving.rpm    = 1900.0;
+    const bridge::LightTarget loader = bridge::lightTargetFor(&driving, tuning);
+    CHECK(near(loader.level, 3.0 + 12.0 * 0.45, 1e-9));
+    CHECK(loader.heat == 0.0);
+    driving.rpm = 3000.0;
+    CHECK(bridge::lightTargetFor(&driving, tuning).level == 15.0);
+
+    // The colour only moves over the last part of the range: nothing at 60%, half way at 80%, all at 100%.
+    driving.rpm = 1000.0 + 0.6 * 2000.0;
+    CHECK(near(bridge::lightTargetFor(&driving, tuning).heat, 0.0, 1e-9));
+    driving.rpm = 1000.0 + 0.8 * 2000.0;
+    CHECK(near(bridge::lightTargetFor(&driving, tuning).heat, 0.5, 1e-9));
+    driving.rpm = 99999.0;
+    CHECK(near(bridge::lightTargetFor(&driving, tuning).heat, 1.0, 1e-9));
+    tuning.colorShift = false;
+    CHECK(bridge::lightTargetFor(&driving, tuning).heat == 0.0);
+    tuning.colorShift = true;
+
+    // An older mod, or a vehicle the game gives no range for: the fallback settings apply.
+    driving.rpmMin = 0.0;
+    driving.rpmMax = 0.0;
+    driving.rpm    = 1550.0;
+    CHECK(near(bridge::lightTargetFor(&driving, tuning).level, 9.0, 1e-9));
+    driving.rpmMin = 2000.0; // nonsense: idle above maximum
+    driving.rpmMax = 1000.0;
+    CHECK(near(bridge::lightTargetFor(&driving, tuning).level, 9.0, 1e-9));
+
+    // An electric motor counts as an engine for this: it is about whether the machine is on.
+    driving.electric = true;
+    driving.rpm      = 2200.0;
+    CHECK(bridge::lightTargetFor(&driving, tuning).level == 15.0);
+
+    // Not driving, no telemetry, or the feature switched off: leave the lights as the user had them.
+    bridge::Telemetry onFoot;
+    onFoot.seq = 2;
+    CHECK(bridge::lightTargetFor(&onFoot, tuning).level < 0.0 && bridge::lightTargetFor(&onFoot, tuning).heat == 0.0);
+    CHECK(bridge::lightTargetFor(nullptr, tuning).level < 0.0);
+    tuning.followEngine = false;
+    CHECK(bridge::lightTargetFor(&driving, tuning).level < 0.0);
+
+    // Odd settings stay inside the handle's range.
+    tuning.followEngine = true;
+    tuning.low          = 40.0;
+    tuning.fullRpm      = 100.0;
+    tuning.colorFrom    = 7.0;
+    const bridge::LightTarget odd = bridge::lightTargetFor(&driving, tuning);
+    CHECK(odd.level == 15.0 && odd.heat >= 0.0 && odd.heat <= 1.0);
+    tuning.low       = std::nan("");
+    tuning.colorFrom = std::nan("");
+    driving.rpm      = 500.0;
+    const bridge::LightTarget nan = bridge::lightTargetFor(&driving, tuning);
+    CHECK(nan.level >= 0.0 && nan.level <= 15.0 && nan.heat >= 0.0 && nan.heat <= 1.0);
+}
+
+void testYokeLightColourRunsFromTheUsersOwnThroughAmberToRed()
+{
+    const bridge::Rgb green{0, 255, 0};
+    CHECK(bridge::YokeLights::colorAt(green, 0.0) == green);
+    CHECK(bridge::YokeLights::colorAt(green, 0.5) == (bridge::Rgb{255, 150, 0}));
+    CHECK(bridge::YokeLights::colorAt(green, 1.0) == (bridge::Rgb{255, 0, 0}));
+    // In between it blends: a quarter of the way is half way from green to amber.
+    CHECK(bridge::YokeLights::colorAt(green, 0.25) == (bridge::Rgb{128, 203, 0}));
+    // Any starting colour works, and nonsense is held to the ends.
+    const bridge::Rgb blue{0, 0, 255};
+    CHECK(bridge::YokeLights::colorAt(blue, 0.0) == blue);
+    CHECK(bridge::YokeLights::colorAt(blue, 1.0) == (bridge::Rgb{255, 0, 0}));
+    CHECK(bridge::YokeLights::colorAt(blue, -3.0) == blue);
+    CHECK(bridge::YokeLights::colorAt(blue, 9.0) == (bridge::Rgb{255, 0, 0}));
+    CHECK(bridge::YokeLights::colorAt(blue, std::nan("")) == blue);
+}
+
+void testYokeLightsChangeAndRestoreTheHandlesSettings()
+{
+    using Clock = bridge::YokeLights::Clock;
+    constexpr int kBrightnessParameter = 4011;
+    constexpr int kColorParameter      = 4012;
+
+    Fixture fixture;
+    const auto writes     = [] { return fake_moza::state().parameterWrites; };
+    const auto colorWrites = [] { return fake_moza::state().listWrites; };
+    const auto rgb         = [](long long r, long long g, long long b) { return std::vector<long long>{r, g, b}; };
+
+    // No handle connected: nothing to attach to, and showing a level writes nothing.
+    {
+        bridge::YokeLights lights;
+        CHECK(!lights.attach());
+        lights.show(5.0, 0.0, Clock::now());
+        CHECK(writes().empty());
+    }
+
+    fake_moza::state().handlePresent                    = true;
+    fake_moza::state().parameters[kBrightnessParameter] = 12;
+    fake_moza::state().listParameters[kColorParameter]  = rgb(0, 255, 0);
+    Clock::time_point when = Clock::now();
+    const auto        later = [&when] { return when += std::chrono::seconds(1); };
+    {
+        bridge::YokeLights lights;
+        CHECK(lights.attach());
+        CHECK(lights.original() == 12 && lights.current() == 12);
+        CHECK(lights.color() == (bridge::Rgb{0, 255, 0}));
+        CHECK(writes().empty()); // attaching only reads
+
+        // The first change goes out at once.
+        lights.show(3.0, 0.0, when);
+        CHECK(writes().size() == 1 && writes().back() == std::make_pair(kBrightnessParameter, 3LL));
+
+        // A request hovering around the same step writes nothing more.
+        lights.show(3.4, 0.0, later());
+        lights.show(2.7, 0.02, later());
+        CHECK(writes().size() == 1);
+
+        // A real change is followed, but not faster than a few times a second.
+        const Clock::time_point burst = later();
+        lights.show(8.0, 0.0, burst);
+        CHECK(writes().size() == 2 && writes().back().second == 8);
+        lights.show(15.0, 0.0, burst + std::chrono::milliseconds(100));
+        CHECK(writes().size() == 2);
+        lights.show(15.0, 0.0, burst + std::chrono::milliseconds(500));
+        CHECK(writes().size() == 3 && writes().back().second == 15);
+        when = burst + std::chrono::milliseconds(500);
+
+        // The colour shifts in steps: half heat is step 4 of 8, which is amber.
+        CHECK(colorWrites().empty());
+        lights.show(15.0, 0.5, later());
+        CHECK(colorWrites().size() == 1 && colorWrites().back() == std::make_pair(kColorParameter, rgb(255, 150, 0)));
+        CHECK(lights.color() == (bridge::Rgb{255, 150, 0}));
+        // Wandering within a step writes nothing; a full step up does; flat out is exactly red.
+        lights.show(15.0, 0.55, later());
+        lights.show(15.0, 0.47, later());
+        CHECK(colorWrites().size() == 1);
+        lights.show(15.0, 0.75, later());
+        CHECK(colorWrites().size() == 2);
+        lights.show(15.0, 1.0, later());
+        CHECK(colorWrites().back().second == rgb(255, 0, 0));
+
+        // Brightness and colour both due: one write per call, brightness first.
+        const auto levelWritesBefore = writes().size() - colorWrites().size();
+        lights.show(6.0, 0.0, later());
+        CHECK(writes().size() - colorWrites().size() == levelWritesBefore + 1);
+        CHECK(colorWrites().back().second == rgb(255, 0, 0));
+        lights.show(6.0, 0.0, later());
+        CHECK(colorWrites().back().second == rgb(0, 255, 0));
+
+        // Fully off is reached exactly, and out-of-range requests are held to the handle's range.
+        lights.show(0.2, 0.0, later());
+        CHECK(lights.current() == 0);
+        lights.show(99.0, 0.0, later());
+        CHECK(lights.current() == 15);
+        lights.show(std::nan(""), 0.0, later());
+        CHECK(lights.current() == 15);
+
+        // "As they were found" puts back the brightness, and the colour whatever heat is asked for.
+        lights.show(15.0, 1.0, later());
+        CHECK(lights.color() == (bridge::Rgb{255, 0, 0}));
+        lights.show(-1.0, 1.0, later());
+        CHECK(lights.current() == 12);
+        lights.show(-1.0, 1.0, later());
+        CHECK(lights.color() == (bridge::Rgb{0, 255, 0}));
+
+        lights.show(4.0, 0.0, later());
+        lights.show(4.0, 1.0, later());
+        CHECK(lights.current() == 4 && lights.color() == (bridge::Rgb{255, 0, 0}));
+    }
+    // Destroyed while changed: both originals are written back.
+    CHECK(fake_moza::state().parameters[kBrightnessParameter] == 12);
+    CHECK(fake_moza::state().listParameters[kColorParameter] == rgb(0, 255, 0));
+
+    // Left unchanged, nothing is written on the way out.
+    const auto before = writes().size();
+    {
+        bridge::YokeLights untouched;
+        CHECK(untouched.attach());
+    }
+    CHECK(writes().size() == before);
+
+    // A handle whose colour cannot be read still gets brightness, and its colour is never written.
+    fake_moza::state().listParameters.erase(kColorParameter);
+    const auto colorsBefore = colorWrites().size();
+    {
+        bridge::YokeLights noColor;
+        CHECK(noColor.attach());
+        noColor.show(5.0, 1.0, later());
+        noColor.show(5.0, 1.0, later());
+        CHECK(noColor.current() == 5);
+    }
+    CHECK(colorWrites().size() == colorsBefore);
+    CHECK(fake_moza::state().parameters[kBrightnessParameter] == 12);
+
+    // A handle whose brightness cannot be read is left alone entirely: there would be nothing to put back.
+    fake_moza::state().parameters.erase(kBrightnessParameter);
+    const auto untouchedWrites = writes().size();
+    {
+        bridge::YokeLights unreadable;
+        CHECK(!unreadable.attach());
+        unreadable.show(5.0, 1.0, later());
+    }
+    CHECK(writes().size() == untouchedWrites);
+}
+
 void testFormatValue()
 {
     Fixture fixture;
@@ -494,6 +792,9 @@ int main()
     testFindFlightBaseWaitsForEnumeration();
     testConditionFromPercent();
     testFormatValue();
+    testLightsFollowEachMachinesOwnEngineRange();
+    testYokeLightColourRunsFromTheUsersOwnThroughAmberToRed();
+    testYokeLightsChangeAndRestoreTheHandlesSettings();
     testPresenceFileBeatsWhileAliveAndIsRemovedAfterwards();
     testPresenceFileStaysQuietWithoutTheModsFolder();
     testDeviceForcesScaleAndRoute();

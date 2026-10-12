@@ -17,7 +17,7 @@ The user profile is normally `Documents\My Games\FarmingSimulator2025` (in Lua:
 The whole file is one ASCII line, rewritten in full on every update:
 
 ```
-MOZAFS 1 seq=4821 t=913400 active=1 speed=5.42 steer=-0.250 mass=8200 rpm=1450 load=0.62 slip=0.04 rough=0.70 field=1 lowered=1 working=1 end=1
+MOZAFS 1 seq=4821 t=913400 active=1 speed=5.42 steer=-0.250 mass=8200 rpm=1450 load=0.62 rpmmin=850 rpmmax=2200 slip=0.04 rough=0.70 surface=6 field=1 lowered=1 working=1 starting=0 electric=0 bumpl=0.00 bumpr=0.00 end=1
 ```
 
 - The line starts with the literal `MOZAFS`, then the format version (`1`), then space-separated
@@ -41,11 +41,46 @@ MOZAFS 1 seq=4821 t=913400 active=1 speed=5.42 steer=-0.250 mass=8200 rpm=1450 l
 | `mass` | kg | 0 | Total mass of the vehicle plus everything attached to it. |
 | `rpm` | 1/min | 0 | Engine speed. |
 | `load` | 0..1 | 0 | Engine load. |
+| `rpmmin` | 1/min | 0 | This vehicle's idle engine speed. 0 or missing means unknown. |
+| `rpmmax` | 1/min | 0 | This vehicle's maximum engine speed. 0 or missing means unknown. Together with `rpmmin` it lets the bridge place `rpm` between idle and flat out for whatever is being driven. |
 | `slip` | 0..1 | 0 | Largest longitudinal slip among the driven wheels. |
 | `rough` | 0..1 | 0 | How rough the surface under the vehicle is: 0 smooth asphalt, about 0.3 a dirt road, about 0.5 grass, about 0.7 a field, 1 the roughest (e.g. freshly ploughed). |
+| `surface` | 1..8 | unknown | What kind of ground most of the wheels are on; see [Surfaces](#surfaces). Left out when the mod cannot tell. |
 | `field` | 0/1 | 0 | 1 while the vehicle is on a field. |
 | `lowered` | 0/1 | 0 | 1 while any attached implement is lowered. |
 | `working` | 0/1 | 0 | 1 while any attached implement is actively working the ground. |
+| `starting` | 0/1 | 0 | 1 while the engine is being started: from the moment the start is triggered until the engine is running. Never 1 for an electric vehicle. |
+| `electric` | 0/1 | 0 | 1 when the vehicle is driven by an electric motor and has no combustion engine. `rpm` and `load` are still reported for it; the bridge uses this flag to leave out engine vibration. |
+| `bumpl` | 0..1 | 0 | How hard the **left** steered wheel is being jolted by something under it right now, e.g. climbing a log, a kerb or a rock: 0 on even ground, about 0.3 a clear bump, 1 a violent hit. Left and right are from the driver's seat. |
+| `bumpr` | 0..1 | 0 | The same for the **right** steered wheel. |
+
+### Surfaces
+
+`rough` says how rough the ground is; `surface` says what it is, so that the bridge can give each
+kind its own feel rather than the same rumble at different strengths. The numbers are fixed:
+
+| `surface` | Ground |
+|---|---|
+| 1 | Paved: asphalt, concrete, bridges, yard slabs. |
+| 2 | Gravel and dirt tracks: hard ground that is not paved. |
+| 3 | Grass, meadows and other soft ground that is not a field. |
+| 4 | Snow. |
+| 5 | A heap of tipped material. |
+| 6 | A field with a settled surface (sown, planted, a seedbed, rolled, ready to harvest), or a field whose state the mod does not know. |
+| 7 | A field broken into clods: ploughed, cultivated, or stubble-tilled. |
+| 8 | A field laid up in ridges. |
+
+With wheels on different ground, the kind most of them are on is sent, and on an even split the
+rougher of the two. A reader must treat a missing key, and any number it does not know, as
+"unknown" and fall back to a plain rumble scaled by `rough`: later versions may add kinds.
+
+### Bumps
+
+`bumpl` and `bumpr` describe single events, not a steady state, and a hit can be over within one
+frame. So the mod holds each value at its peak and lets it fall back to 0 over roughly 150 ms; the
+bridge then cannot miss it between two polls. Ordinary field roughness belongs in `rough` and
+should leave both near 0. The bridge turns the difference into a kick of the wheel toward the
+side that was hit; equal bumps on both sides cancel.
 
 ## Timing
 
