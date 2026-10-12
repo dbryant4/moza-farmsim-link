@@ -456,7 +456,8 @@ ForceOutput ForceModel::target(const Telemetry* telemetry) const
     const bool   combustion   = !telemetry->electric;
     const double engine       = combustion && rpm > 0.0 ? s.engineRumble * engineShare : 0.0;
     const double hzSpeedShare = unit(s.engineHzSpeedShare);
-    const double engineHz     = bandLow + (bandHigh - bandLow) * unit((1.0 - hzSpeedShare) * revs + hzSpeedShare * pace);
+    const double idleHz       = sanitize(idleRpm / 60.0, bandLow, bandHigh);
+    const double engineHz     = idleHz + (bandHigh - idleHz) * unit((1.0 - hzSpeedShare) * revs + hzSpeedShare * pace);
     const double starting     = combustion ? unit(s.engineStartShake) * m_startShake : 0.0;
     const double startingHz   = sanitize(s.engineStartHz, bandLow, bandHigh);
 

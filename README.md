@@ -254,9 +254,13 @@ spring scale 34%, damper scale 20%, torque limit 100%).
   axes four times a second for the status display, and with *Lights follow the engine* on it was
   also writing the handle's brightness and colour as the engine speed moved. Every lock-up seen
   (seven over two days) happened while driving with the lights setting on, at worst every minute;
-  with it off there were none, including ten hours idle. The torque readout has been taken out of
-  the link loop, so the light writes are now the only replies the link provokes. Whether that is
-  enough for the lights to be safe is not yet known. Since nothing can free a thread stuck like that, the
+  with it off there were none, including ten hours idle. 0.1.3-pre3 took the torque
+  readout out of the link loop to halve those replies, and with it gone **no force reached the
+  yoke at all**: the link ran, sent every command and reported nothing wrong, and the yoke stayed
+  limp. Something in the SDK or the base needs those requests to keep coming for effects to play
+  (a heartbeat, perhaps); what exactly is not known. 0.1.3-pre4 put the readout back. So the
+  lock-up cannot be avoided from this side while the lights setting is on, and that setting says
+  so. Since nothing can free a thread stuck like that, the
   link loop is watched (`stall_guard.hpp`): after 10 s without a pass the process ends itself and,
   in the tray program, starts a fresh copy, at most three times in a row.
 

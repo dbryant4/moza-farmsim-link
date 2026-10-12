@@ -1046,21 +1046,24 @@ void testEngineRumbleIsOptIn()
 
     ForceSettings settings;
     settings.engineRumble = 0.10;
-    const double band     = settings.rumbleMaxHz - settings.rumbleMinHz;
     const double idleShare = settings.engineRumbleIdleShare;
 
-    // Idling at a standstill: the gentlest it gets, at the slow end of the band.
+    // Idling at a standstill: the gentlest it gets, shaking as fast as the engine turns (850 a
+    // minute is 14.2 a second), not down at the slow end of the band where it is a wobble.
+    const double idleHz = 850.0 / 60.0;
+    const double climb  = settings.rumbleMaxHz - idleHz;
     Telemetry idling = revving;
     idling.rpm       = 850.0;
     idling.load      = 0.0;
     const ForceOutput idle = settled(idling, settings);
     CHECK(near(idle.rumble, 0.10 * idleShare, 1e-6));
-    CHECK(near(idle.rumbleHz, settings.rumbleMinHz, 1e-6));
+    CHECK(near(idle.rumbleHz, idleHz, 1e-6));
+    CHECK(idle.rumbleHz > settings.rumbleMinHz + 5.0);
 
     // Flat out under load but standing still: everything except the part that comes from moving.
     const ForceOutput loaded = settled(revving, settings);
     CHECK(near(loaded.rumble, 0.10 * (idleShare + (1.0 - idleShare) * (settings.engineRumbleRevShare + settings.engineRumbleLoadShare)), 1e-6));
-    CHECK(near(loaded.rumbleHz, settings.rumbleMinHz + band * (1.0 - settings.engineHzSpeedShare), 1e-6));
+    CHECK(near(loaded.rumbleHz, idleHz + climb * (1.0 - settings.engineHzSpeedShare), 1e-6));
 
     // Flat out, loaded and at speed on a smooth road: all of it, at the fast end.
     Telemetry flatOut = revving;
@@ -1109,7 +1112,15 @@ void testEngineRumbleIsOptIn()
     Telemetry unknown = combine;
     unknown.rpmMin    = 0.0;
     unknown.rpmMax    = 0.0;
-    CHECK(near(settled(unknown, settings).rumbleHz, settled(revving, settings).rumbleHz - band * (1.0 - settings.engineHzSpeedShare) * (200.0 / 1350.0), 1e-6));
+    CHECK(near(settled(unknown, settings).rumbleHz, settled(revving, settings).rumbleHz - climb * (1.0 - settings.engineHzSpeedShare) * (200.0 / 1350.0), 1e-6));
+    // An idle slower or faster than the band allows starts at the band's nearest end.
+    ForceSettings narrow = settings;
+    narrow.rumbleMinHz   = 18.0;
+    CHECK(near(settled(idling, narrow).rumbleHz, 18.0, 1e-6));
+    narrow.rumbleMinHz = 4.0;
+    narrow.rumbleMaxHz = 10.0;
+    CHECK(near(settled(idling, narrow).rumbleHz, 10.0, 1e-6));
+    CHECK(near(settled(flatOut, narrow).rumbleHz, 10.0, 1e-6));
     Telemetry backwards = combine;
     backwards.rpmMin    = 3000.0;
     backwards.rpmMax    = 1000.0;
@@ -1171,7 +1182,7 @@ void testEngineStartShakes()
     CHECK(justAfter > 0.5 * settings.engineStartShake);
     const ForceOutput running = settle(model, &idling, 5.0);
     CHECK(near(running.rumble, settings.engineRumble * settings.engineRumbleIdleShare, 1e-4));
-    CHECK(near(running.rumbleHz, settings.rumbleMinHz, 0.05));
+    CHECK(near(running.rumbleHz, 850.0 / 60.0, 0.05));
 
     // A start the game draws out for three seconds: the shake has made its point and gone well
     // before that, within the length it is allowed, and does not come back when the engine catches.

@@ -268,6 +268,8 @@ void registerStatus(StatusBoard& status)
     status.addRanged("game.accel", "Game", "Acceleration", "m/s\xC2\xB2", -5, 5, 2);
     status.addRanged("force.sway", "Forces", "Pitch sway target", "", -0.5, 0.5, 3);
     status.addRanged("force.pitch_push", "Forces", "Pitch push", "%", -100, 100, 0);
+    status.addRanged("yoke.roll_torque", "Yoke", "Roll motor", "N\xC2\xB7m", -0.5, 0.5, 3);
+    status.addRanged("yoke.pitch_torque", "Yoke", "Pitch motor", "N\xC2\xB7m", -0.5, 0.5, 3);
     status.add("yoke.lights", "Yoke", "Lights");
     status.add("bridge.send_errors", "Bridge", "Commands that failed to send", "", 0);
 }
@@ -284,6 +286,17 @@ Condition condition(std::int16_t coefficient, int fullScale)
     result.coefficient = coefficient;
     result.saturation  = static_cast<std::uint16_t>(std::clamp(fullScale, 0, 65535));
     return result;
+}
+
+/** Latest cached torque reading in N*m, or NaN. The SDK hands these back as doubles already in N*m. */
+double cachedTorque(const moza::RawParameter& parameter)
+{
+    auto [err, value] = parameter.getValue();
+    if (err != MOZA_ERR_NO_ERROR)
+    {
+        return std::nan("");
+    }
+    return value.isFloat() ? value.asDouble() : value.asInt() / 10000.0;
 }
 
 const char* surfaceLabel(Surface surface)
@@ -589,11 +602,14 @@ int runLink(moza::as::Wheelbase& base, const moza::HidDevice& hid, const LinkOpt
     const auto statusInterval  = std::chrono::milliseconds(100);
     const auto printInterval   = std::chrono::seconds(1);
 
-    // The link reads no parameters from the base while it runs. It used to ask for the motor torque
-    // of both axes four times a second, only to show it; the SDK (1.0.0.4) handles each reply on
-    // one of several threads, and two replies handled at once can lock those threads against each
-    // other for good, which took the link down mid-drive. See "The SDK can lock itself up" in the
-    // README. `--list` still prints the torque, once.
+    // The motor torque of both axes is asked for four times a second. It is shown in the status, but
+    // that is not why it is here: 0.1.3-pre3 stopped asking, and from then on no force reached the
+    // yoke at all, although every command was still being sent. Something in the SDK or the base
+    // needs these requests to keep coming for effects to play; what, exactly, is not known. They
+    // are also half of the replies behind the SDK's lock-up (see the README), which is the price.
+    const auto torqueInterval = std::chrono::milliseconds(250);
+    const moza::RawParameter torqueX = base.steerTorqueOutX().raw();
+    const moza::RawParameter torqueY = base.steerTorqueOutY().raw();
 
     const auto   start       = Clock::now();
     auto         lastModel   = start;
@@ -602,6 +618,7 @@ int runLink(moza::as::Wheelbase& base, const moza::HidDevice& hid, const LinkOpt
     auto         nextRefresh = start;
     auto         nextRumble  = start;
     auto         nextStatus  = start;
+    auto         nextTorque  = start;
     auto         nextPrint   = start;
     ForceOutput  output      = model.output();
     DeviceForces sent;
@@ -709,6 +726,14 @@ int runLink(moza::as::Wheelbase& base, const moza::HidDevice& hid, const LinkOpt
         const LightTarget lightTarget = lightTargetFor(view.fresh(), lightTuning);
         lights.show(lightTarget.level, lightTarget.heat, now);
 
+        if (now >= nextTorque)
+        {
+            // Asynchronous: the reply lands in the SDK's cache and is picked up by a later status update.
+            torqueX.fetch();
+            torqueY.fetch();
+            nextTorque = now + torqueInterval;
+        }
+
         if (now >= nextStatus)
         {
             const Telemetry& sample = view.sample;
@@ -759,6 +784,8 @@ int runLink(moza::as::Wheelbase& base, const moza::HidDevice& hid, const LinkOpt
             status.set("game.accel", live ? model.acceleration() : 0.0);
             status.set("force.sway", sent.pitchCenter / static_cast<double>(std::max(1, options.fullScale)));
             status.set("force.pitch_push", -sent.pitchPush * scale);
+            status.set("yoke.roll_torque", cachedTorque(torqueX));
+            status.set("yoke.pitch_torque", cachedTorque(torqueY));
             status.setText("yoke.lights", !lightTuning.followEngine ? "not following the engine"
                                           : !lights.attached()      ? "no yoke handle found"
                                                                     : "brightness " + std::to_string(lights.current()) + " of 15, colour " +

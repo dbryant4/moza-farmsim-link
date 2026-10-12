@@ -149,8 +149,12 @@ struct ForceSettings
     double engineRumbleLoadShare  = 0.25;
     double engineRumbleSpeedShare = 0.25;
     /**
-     * The frequency runs from the slow end of the rumble band at idle to the fast end flat out;
-     * this much of that climb comes from road speed rather than engine speed, 0..1.
+     * The frequency starts at the engine's own turning rate at idle (850 turns a minute is 14 a
+     * second), held inside the rumble band, and climbs to the fast end of the band flat out.
+     * This much of that climb comes from road speed rather than engine speed, 0..1.
+     *
+     * It does not start at the slow end of the band: at 8 Hz an idling engine was a slow wobble
+     * that was not felt as an engine at all (0.1.3-pre3).
      */
     double engineHzSpeedShare = 0.20;
     /** Idle and maximum engine speed assumed for a machine that does not report its own, 1/min. */

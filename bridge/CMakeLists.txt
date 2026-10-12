@@ -3,7 +3,7 @@ project(moza_fs_bridge VERSION 0.1.3 LANGUAGES CXX)
 
 # Which pre-release of that version this is: 1 builds 0.1.3-pre1, published as tag v0.1.3-pre1.
 # For the finished version leave the number out: set(BRIDGE_PRERELEASE ). scripts/package-release.sh reads this line.
-set(BRIDGE_PRERELEASE 3)
+set(BRIDGE_PRERELEASE 4)
 if(BRIDGE_PRERELEASE)
     set(BRIDGE_VERSION_TEXT "${PROJECT_VERSION}-pre${BRIDGE_PRERELEASE}")
 else()
