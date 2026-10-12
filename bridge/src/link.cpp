@@ -163,7 +163,8 @@ void registerSettings(Settings& settings)
                        "Turn on if the yoke leans the wrong way when you pull away.", false);
     settings.addToggle(kLightsKey, "Yoke lights", "Lights follow the engine",
                        "Off with the engine off, dim at idle, brighter with engine speed. Changes the handle's stored brightness "
-                       "while the bridge runs and puts it back when it stops.",
+                       "while the link runs and puts it back when it stops. With MOZA's SDK 1.0.0.4 this has made the SDK lock up "
+                       "now and then; the link then restarts itself, with forces gone for about fifteen seconds.",
                        false);
     settings.addNumber(kLightsLowKey, "Yoke lights", "Brightness at idle", "How bright the lights are with the engine idling.", "of 15", 1,
                        15, 1, LightTuning{}.low);
@@ -490,6 +491,16 @@ DeviceForces toDeviceForces(const ForceOutput& output, const LinkTuning& tuning,
     return forces;
 }
 
+void registerLinkSettings(Settings& settings)
+{
+    registerSettings(settings);
+}
+
+void registerLinkStatus(StatusBoard& status)
+{
+    registerStatus(status);
+}
+
 int runLink(moza::as::Wheelbase& base, const moza::HidDevice& hid, const LinkOptions& options, const std::atomic<bool>& stop)
 {
     Settings settings;
@@ -547,6 +558,11 @@ int runLink(moza::as::Wheelbase& base, const moza::HidDevice& hid, const LinkOpt
         return 4;
     }
     std::puts("Linked. Forces follow the game; with no game they stay at the idle settings.");
+    const LinkPanel panel{&settings, &status, options.settingsPath};
+    if (options.onPanel)
+    {
+        options.onPanel(&panel);
+    }
     if (options.onStarted)
     {
         options.onStarted(ui.running() ? static_cast<int>(ui.port()) : 0);
@@ -774,6 +790,10 @@ int runLink(moza::as::Wheelbase& base, const moza::HidDevice& hid, const LinkOpt
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 
+    if (options.onPanel)
+    {
+        options.onPanel(nullptr);
+    }
     // Each of these talks to something that can fail to answer; the guard hears about every step.
     alive();
     ui.stop();

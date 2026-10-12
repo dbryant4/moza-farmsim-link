@@ -5,7 +5,7 @@ yoke's roll axis used as steering.
 
 | Path | What |
 | --- | --- |
-| `bridge/` | Windows program that reads the game's telemetry and drives the base through the MOZA SDK (C++20, CMake). Serves its own settings page. |
+| `bridge/` | Windows program that reads the game's telemetry and drives the base through the MOZA SDK (C++20, CMake). The everyday program has a settings window; the console one serves the same settings as a web page. |
 | `fs-mod/` | `FS25_MozaYokeLink`, the FS25 Lua mod that writes the telemetry file. See `fs-mod/README.md`. |
 | `docs/telemetry.md` | The telemetry file format both sides are built against. |
 | `sdk/` | Where the MOZA SDK goes. **Not included in this repository**; see "Getting the MOZA SDK". |
@@ -20,7 +20,7 @@ Every part works on the real hardware, and the mod has been driven in the game:
 
 - **Bridge and yoke:** tested on the real AY210 (2026-10-05), including the whole chain driven by
   simulated telemetry: centering that grows with speed, weight, and rumble all reach the motors.
-- **Settings page:** tested in a browser on the Mac and served correctly on the PC.
+- **Settings:** `moza_fs_link.exe` has a native settings window (`settings_window_win.cpp`), opened from the tray icon. It was drawn to an image on the PC and its controls worked by its own self-test there (`--render-settings`, `--selftest-settings`); nobody has yet used it by hand. The web page it replaces is still served by `moza_fs_bridge.exe`, and by the tray program with `--web-ui`; it was tested in a browser on the Mac.
 - **FS25 mod:** loads in FS25 1.24, writes telemetry about 60 times a second, and the bridge
   follows it live (first drive 2026-10-05). The individual values (slip, surface roughness,
   implement state) have only been spot-checked. `fs-mod/README.md` lists what to look for.
@@ -33,15 +33,15 @@ Every part works on the real hardware, and the mod has been driven in the game:
    because its start-up reset would cut that simulator's forces.
 2. On the PC, run `moza_fs_link.exe`. No window opens: it puts a steering-wheel icon by the clock
    (on Windows 11 new icons start in the `^` overflow; drag it out to keep it visible) and the yoke
-   gets a light centering. Click the icon to open the settings page, http://127.0.0.1:8777/.
+   gets a light centering. Click the icon to open the settings window.
 3. Start FS25. When loading the savegame, tick **MOZA Yoke Link** in the mod list.
 4. Get in a vehicle and drive. The page's status should change to "live, driving".
 5. Tune with the sliders; changes apply at once. **Save** keeps them for next time
    (`moza_fs_bridge.ini` next to the program).
 
-To stop: right-click the icon and choose Exit. The page's **Release forces** button drops all
-forces without stopping the bridge. Starting `moza_fs_link.exe` again while it is running just opens
-the settings page; `moza_fs_link.exe --quit` stops it from a script. What it prints goes to
+To stop: right-click the icon and choose Exit. The settings window's **Release forces** button
+drops all forces without stopping the bridge. Starting `moza_fs_link.exe` again while it is running
+just opens the settings window; `moza_fs_link.exe --quit` stops it from a script. What it prints goes to
 `moza_fs_bridge.log` beside the program (right-click the icon, *Open log file*).
 
 `moza_fs_bridge.exe` is the same bridge as a console program. Use it for the test options below,

@@ -58,13 +58,14 @@ struct Tray::Impl
     HWND        window          = nullptr;
     HANDLE      ready           = nullptr;
     HANDLE      quitEvent       = nullptr;
+    HANDLE      showEvent       = nullptr;
     UINT        taskbarCreated  = 0;
     HICON       icon            = nullptr;
 
     // Written by any thread, read by the tray thread when it handles kUpdateMessage.
     std::mutex   mutex;
     std::wstring status = L"MOZA FS25 link";
-    std::wstring settingsUrl;
+    bool         settingsAvailable = false;
     std::wstring updateVersion;
     bool         updateInstallable = false;
     std::wstring balloonTitle;
@@ -113,14 +114,14 @@ struct Tray::Impl
 
     void openSettings()
     {
-        std::wstring url;
+        bool available;
         {
             std::scoped_lock lock(mutex);
-            url = settingsUrl;
+            available = settingsAvailable;
         }
-        if (!url.empty())
+        if (available && config.openSettings)
         {
-            ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            config.openSettings();
         }
     }
 
@@ -131,7 +132,7 @@ struct Tray::Impl
         bool         installable;
         {
             std::scoped_lock lock(mutex);
-            haveSettings = !settingsUrl.empty();
+            haveSettings = settingsAvailable;
             newer        = updateVersion;
             installable  = updateInstallable;
         }
@@ -276,15 +277,34 @@ struct Tray::Impl
         bool quitSeen = false;
         for (;;)
         {
-            const DWORD handles = quitEvent != nullptr && !quitSeen ? 1 : 0;
-            const DWORD result  = MsgWaitForMultipleObjects(handles, &quitEvent, FALSE, INFINITE, QS_ALLINPUT);
-            if (handles == 1 && result == WAIT_OBJECT_0)
+            // The quit event stays set once seen, so it is only waited on until then.
+            HANDLE waitOn[2];
+            DWORD  handles = 0;
+            if (showEvent != nullptr)
             {
-                // Another instance was started with --quit.
-                quitSeen = true;
-                if (config.requestExit)
+                waitOn[handles++] = showEvent;
+            }
+            const DWORD quitAt = handles;
+            if (quitEvent != nullptr && !quitSeen)
+            {
+                waitOn[handles++] = quitEvent;
+            }
+            const DWORD result = MsgWaitForMultipleObjects(handles, waitOn, FALSE, INFINITE, QS_ALLINPUT);
+            if (result < WAIT_OBJECT_0 + handles)
+            {
+                if (showEvent != nullptr && result == WAIT_OBJECT_0)
                 {
-                    config.requestExit();
+                    // The program was started a second time: that asks for the settings.
+                    openSettings();
+                }
+                else if (result == WAIT_OBJECT_0 + quitAt)
+                {
+                    // Another instance was started with --quit.
+                    quitSeen = true;
+                    if (config.requestExit)
+                    {
+                        config.requestExit();
+                    }
                 }
                 continue;
             }
@@ -296,6 +316,10 @@ struct Tray::Impl
                 {
                     quit = true;
                     break;
+                }
+                if (config.translate && config.translate(&message))
+                {
+                    continue;
                 }
                 TranslateMessage(&message);
                 DispatchMessageW(&message);
@@ -310,8 +334,9 @@ struct Tray::Impl
 
 Tray::Tray(Config config) : m_impl(std::make_unique<Impl>())
 {
-    m_impl->settingsUrl = widen(config.settingsUrl);
     m_impl->config      = std::move(config);
+    // Auto-reset: each setting of it opens the settings once.
+    m_impl->showEvent   = m_impl->config.showEventName != nullptr ? CreateEventW(nullptr, FALSE, FALSE, m_impl->config.showEventName) : nullptr;
     m_impl->ready       = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     m_impl->quitEvent   = CreateEventW(nullptr, TRUE, FALSE, quitEventName());
     m_impl->thread      = std::thread([impl = m_impl.get()] { impl->run(); });
@@ -336,6 +361,10 @@ Tray::~Tray()
     {
         CloseHandle(m_impl->quitEvent);
     }
+    if (m_impl->showEvent != nullptr)
+    {
+        CloseHandle(m_impl->showEvent);
+    }
 }
 
 void Tray::setStatus(const std::string& text)
@@ -350,10 +379,10 @@ void Tray::setStatus(const std::string& text)
     }
 }
 
-void Tray::setSettingsUrl(const std::string& url)
+void Tray::setSettingsAvailable(bool available)
 {
     std::scoped_lock lock(m_impl->mutex);
-    m_impl->settingsUrl = widen(url);
+    m_impl->settingsAvailable = available;
 }
 
 void Tray::setUpdate(const std::string& name, bool installable)

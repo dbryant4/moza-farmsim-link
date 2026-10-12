@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <initializer_list>
 #include <memory>
 #include <mutex>
@@ -43,6 +44,9 @@
 
 #ifdef BRIDGE_TRAY
 #include "mod_sync.hpp"
+#include "settings.hpp"
+#include "settings_window.hpp"
+#include "status_board.hpp"
 #include "tray.hpp"
 #endif
 
@@ -106,6 +110,9 @@ Clock::time_point g_linkStarted{};
 #ifdef BRIDGE_TRAY
 void restartAfterStall();
 #endif
+#ifdef _WIN32
+void snapshotStuckProcess();
+#endif
 
 void onLinkStalled(std::chrono::milliseconds silent)
 {
@@ -113,6 +120,9 @@ void onLinkStalled(std::chrono::milliseconds silent)
                  "The link has not moved for %.0f s: it is stuck inside the MOZA SDK, which cannot be undone from within. "
                  "The base lets go of its forces by itself. Ending this process.\n",
                  static_cast<double>(silent.count()) / 1000.0);
+#ifdef _WIN32
+    snapshotStuckProcess();
+#endif
 #ifdef BRIDGE_TRAY
     // Not when the user had already asked it to stop: then ending is all that was wanted.
     if (!g_stop)
@@ -139,6 +149,7 @@ void withTray(Use use)
 }
 
 bridge::Updater*  g_updater = nullptr;
+bridge::SettingsWindow* g_settingsWindow = nullptr;
 /** Follows the "look for new versions" setting once the link has loaded its settings. */
 std::atomic<bool> g_checkUpdates{true};
 /** Follows the "include pre-releases" setting the same way. */
@@ -201,7 +212,17 @@ struct Options
     bool        allowFlightSim = false;
     std::string telemetryPath;
     std::string settingsPath;
+#ifdef BRIDGE_TRAY
+    // The tray program has a settings window of its own; the web page is for looking in from elsewhere.
+    int         uiPort = 0;
+#else
     int         uiPort = 8777;
+#endif
+    /** Test option of the tray program: draw the settings window into this .bmp file and exit. */
+    std::string renderSettings;
+    int         renderPage = 1;
+    /** Test option of the tray program: work the settings window's controls unseen and write what happened to this file. */
+    std::string selfTestSettings;
     bool        list    = false;
     bool        verbose = false;
     bool        restart = true;
@@ -226,6 +247,8 @@ struct Options
     /** Set by the program when it starts itself again after getting stuck: which restart in a row this is, and the process to wait for. */
     int         restarted     = 0;
     unsigned long afterPid    = 0;
+    /** Internal: write a memory snapshot of this other process beside the program and exit. */
+    unsigned long snapshotPid = 0;
     /** Test option: freeze the link loop this many seconds in, as a call into the SDK that never returns would. 0 is off. */
     double      testStallAfter = 0.0;
     /** Axis whose spring center is swept back and forth, or -1 for a fixed center. */
@@ -257,8 +280,10 @@ void printUsage()
         "\n"
         "  --telemetry PATH   Telemetry file (default: the mod's file in the FS25 profile folder)\n"
         "  --settings PATH    Settings file (default: moza_fs_bridge.ini next to this program)\n"
-        "  --ui-port N        Port for the settings page (default: 8777)\n"
-        "  --no-ui            Do not serve the settings page\n"
+        "  --web-ui           Serve the settings as a web page on 127.0.0.1:8777 (moza_fs_bridge does by default;\n"
+        "                     moza_fs_link, which has a settings window, only when asked)\n"
+        "  --ui-port N        The same on another port\n"
+        "  --no-ui            Do not serve the web page\n"
         "  --allow-flight-sim Run even while X-Plane or another flight simulator is running\n"
         "\n"
         "Test options (no game needed):\n"
@@ -347,6 +372,10 @@ Options parseOptions(int argc, char** argv)
         else if (arg == "--settings") options.settingsPath = next();
         else if (arg == "--ui-port") options.uiPort = static_cast<int>(parseNumber("--ui-port", next(), 1, 65535));
         else if (arg == "--no-ui") options.uiPort = 0;
+        else if (arg == "--web-ui") options.uiPort = options.uiPort > 0 ? options.uiPort : 8777;
+        else if (arg == "--render-settings") options.renderSettings = next();
+        else if (arg == "--selftest-settings") options.selfTestSettings = next();
+        else if (arg == "--render-page") options.renderPage = static_cast<int>(parseNumber("--render-page", next(), 0, 100));
         else if (arg == "--verbose") options.verbose = true;
         else if (arg == "--no-restart") options.restart = false;
         else if (arg == "--device") options.device = next();
@@ -420,6 +449,7 @@ Options parseOptions(int argc, char** argv)
         else if (arg == "--fetch-update") options.checkUpdate = options.fetchUpdate = true;
         else if (arg == "--prereleases") options.prereleases = true;
         else if (arg == "--test-stall-after") options.testStallAfter = parseNumber("--test-stall-after", next(), 0, 86400);
+        else if (arg == "--snapshot-pid") options.snapshotPid = static_cast<unsigned long>(parseNumber("--snapshot-pid", next(), 0, 4294967295.0));
         else if (arg == "--restarted") options.restarted = static_cast<int>(parseNumber("--restarted", next(), 0, 1000));
         else if (arg == "--after-pid") options.afterPid = static_cast<unsigned long>(parseNumber("--after-pid", next(), 0, 4294967295.0));
         else usageError("Unknown option: " + arg);
@@ -740,7 +770,7 @@ void printStatus(double elapsed, const moza::as::Wheelbase& base, const moza::Hi
 
 bool isLinkMode(const Options& options)
 {
-    return !options.checkUpdate && !options.list && !options.hold && options.sweepAxis < 0 && options.forceAxis < 0 && options.sineAxis < 0 && options.strokeAxis < 0;
+    return options.renderSettings.empty() && options.selfTestSettings.empty() && !options.checkUpdate && !options.list && !options.hold && options.sweepAxis < 0 && options.forceAxis < 0 && options.sineAxis < 0 && options.strokeAxis < 0;
 }
 
 /** Folder holding this program, where its settings file lives by default. */
@@ -891,19 +921,31 @@ int run(const Options& options)
                     // Only now, with the settings loaded, is it known whether the user wants checks at all.
                     g_updater->start();
                 }
-                if (port > 0)
-                {
-                    g_tray->setSettingsUrl("http://127.0.0.1:" + std::to_string(port) + "/");
-                }
+                (void)port;
                 if (g_restarts > 0)
                 {
                     g_tray->notify("MOZA FS25 link restarted itself", "MOZA's SDK had stopped answering. Forces are back; the log has the details.");
                 }
                 else
                 {
-                    g_tray->notify("MOZA FS25 link is running", port > 0 ? "Click this icon to open the settings."
-                                                                        : "The settings page could not start; see the log.");
+                    g_tray->notify("MOZA FS25 link is running", "Click this icon to open the settings.");
                 }
+            };
+            // The settings window shows the link's own objects, for exactly as long as they exist.
+            link.onPanel = [](const bridge::LinkPanel* panel) {
+                if (g_settingsWindow == nullptr)
+                {
+                    return;
+                }
+                if (panel != nullptr)
+                {
+                    g_settingsWindow->attach({panel->settings, panel->status, panel->settingsFile, BRIDGE_VERSION});
+                }
+                else
+                {
+                    g_settingsWindow->detach();
+                }
+                g_tray->setSettingsAvailable(panel != nullptr);
             };
             link.onStatus = [](const std::string& text) { g_tray->setStatus("MOZA FS25 link: " + text); };
         }
@@ -1406,6 +1448,71 @@ private:
 };
 #endif
 
+#ifdef _WIN32
+namespace {
+
+/**
+ * Writes a memory snapshot of process @p pid to @p file: every thread's stack, which is what
+ * shows where a stuck one is waiting. Returns a process exit code.
+ */
+int writeSnapshot(unsigned long pid, const std::filesystem::path& file)
+{
+    using Writer = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, int, void*, void*, void*);
+    const HMODULE library = LoadLibraryW(L"dbghelp.dll");
+    const Writer  write   = library != nullptr ? reinterpret_cast<Writer>(reinterpret_cast<void*>(GetProcAddress(library, "MiniDumpWriteDump"))) : nullptr;
+    const HANDLE  process = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_DUP_HANDLE, FALSE, static_cast<DWORD>(pid));
+    if (write == nullptr || process == nullptr)
+    {
+        return 1;
+    }
+    const HANDLE out = CreateFileW(file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (out == INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(process);
+        return 1;
+    }
+    // MiniDumpNormal | MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithThreadInfo: about half a megabyte.
+    const BOOL ok = write(process, static_cast<DWORD>(pid), out, 0x1040, nullptr, nullptr, nullptr);
+    CloseHandle(out);
+    CloseHandle(process);
+    return ok ? 0 : 1;
+}
+
+/**
+ * Has a second copy of this program photograph this stuck one before it is ended. From outside,
+ * because a process that snapshots itself has to stop its own threads, and one of those may hold
+ * a lock the snapshot needs. Waits a few seconds at most.
+ */
+void snapshotStuckProcess()
+{
+    wchar_t     self[1024];
+    const DWORD length = GetModuleFileNameW(nullptr, self, ARRAYSIZE(self));
+    if (length == 0 || length >= ARRAYSIZE(self))
+    {
+        return;
+    }
+    const std::filesystem::path file    = executableDirectory() / "moza_fs_link_stuck.dmp";
+    // The other copy works the file's place out for itself: it is the same program in the same folder.
+    std::wstring                command = L"\"" + std::wstring(self) + L"\" --snapshot-pid " + std::to_wstring(GetCurrentProcessId());
+    STARTUPINFOW        startup{};
+    PROCESS_INFORMATION process{};
+    startup.cb = sizeof(startup);
+    if (!CreateProcessW(self, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process))
+    {
+        return;
+    }
+    const bool done = WaitForSingleObject(process.hProcess, 8000) == WAIT_OBJECT_0;
+    DWORD      code = 1;
+    GetExitCodeProcess(process.hProcess, &code);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    std::fprintf(stderr, done && code == 0 ? "A snapshot of where it is stuck was written to %s.\n" : "A snapshot of where it is stuck could not be written (%s).\n",
+                 file.string().c_str());
+}
+
+} // namespace
+#endif
+
 /** Last stop before the process ends: in the windowless build, a failure is shown instead of printed. */
 int finish(int result)
 {
@@ -1428,6 +1535,13 @@ int main(int argc, char** argv)
 
     Options options = parseOptions(argc, argv);
     g_verbose       = options.verbose;
+#ifdef _WIN32
+    if (options.snapshotPid != 0)
+    {
+        // Started by a stuck copy of this program to photograph it; nothing else happens in this one.
+        return writeSnapshot(options.snapshotPid, executableDirectory() / "moza_fs_link_stuck.dmp");
+    }
+#endif
     installStopHandler();
 
 #ifdef BRIDGE_TRAY
@@ -1440,6 +1554,41 @@ int main(int argc, char** argv)
             CloseHandle(quitEvent);
         }
         return 0;
+    }
+    if (!options.renderSettings.empty() || !options.selfTestSettings.empty())
+    {
+        // Draws the settings window as it would open, with every setting at its default and some
+        // made-up status, and never shows it or goes near the yoke.
+        bridge::Settings settings;
+        bridge::registerLinkSettings(settings);
+        bridge::StatusBoard status;
+        bridge::registerLinkStatus(status);
+        status.setText("game.telemetry", "live, driving");
+        status.setText("game.surface", "gravel or dirt track");
+        status.setText("game.engine", "running");
+        status.setText("game.implement", "raised or none");
+        status.set("game.speed", 14.4);
+        status.set("game.steer", -0.12);
+        status.set("game.mass", 8.2);
+        status.set("force.centering", 33.0);
+        status.set("force.rumble", 16.0);
+        status.set("force.rumble_hz", 14.0);
+        bridge::SettingsWindow window;
+        if (!options.selfTestSettings.empty())
+        {
+            // Its own settings file, so that a real one beside the program is never touched.
+            const std::filesystem::path report = widen(options.selfTestSettings);
+            std::filesystem::path       scratch = report;
+            scratch += L".settings.ini";
+            window.attach({&settings, &status, scratch, BRIDGE_VERSION});
+            const std::string result = window.selfTest();
+            std::ofstream(report, std::ios::binary | std::ios::trunc) << result;
+            std::error_code ignored;
+            std::filesystem::remove(scratch, ignored);
+            return result.find("FAIL") == std::string::npos ? 0 : 1;
+        }
+        window.attach({&settings, &status, executableDirectory() / "moza_fs_bridge.ini", BRIDGE_VERSION});
+        return window.renderToFile(std::filesystem::path(widen(options.renderSettings)), options.renderPage) ? 0 : 1;
     }
     if (!isLinkMode(options))
     {
@@ -1472,7 +1621,12 @@ int main(int argc, char** argv)
     }
     if (GetLastError() == ERROR_ALREADY_EXISTS)
     {
-        bridge::Tray::openInBrowser("http://127.0.0.1:" + std::to_string(options.uiPort) + "/");
+        // Already running: ask that copy to show its settings.
+        if (const HANDLE show = OpenEventW(EVENT_MODIFY_STATE, FALSE, bridge::SettingsWindow::showEventName()))
+        {
+            SetEvent(show);
+            CloseHandle(show);
+        }
         return 0;
     }
     if (!options.waitGiven)
@@ -1507,7 +1661,14 @@ int main(int argc, char** argv)
         g_updater = updater.get();
     }
 
+    // Made before the icon and ended after it: the icon's thread is the one the window lives on.
+    auto settingsWindow = std::make_unique<bridge::SettingsWindow>();
+    g_settingsWindow    = settingsWindow.get();
+
     bridge::Tray::Config trayConfig;
+    trayConfig.openSettings  = [] { g_settingsWindow->show(); };
+    trayConfig.translate     = [](void* message) { return g_settingsWindow->translate(message); };
+    trayConfig.showEventName = bridge::SettingsWindow::showEventName();
     if (updater)
     {
         trayConfig.checkForUpdates = [] { g_updater->checkNow(); };

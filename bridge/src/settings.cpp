@@ -430,7 +430,7 @@ std::string Settings::exportText() const
 
 std::string Settings::settingsText(const std::vector<SettingState>& states)
 {
-    std::string text = "# moza_fs_bridge settings. Loaded when the bridge starts and rewritten by Save in the web UI.\n"
+    std::string text = "# moza_fs_bridge settings. Loaded when the link starts and rewritten by Save in its settings.\n"
                        "# Safe to edit by hand while the bridge is not running: one 'key = value' per line,\n"
                        "# lines starting with # are comments, and anything missing or unreadable falls back to its default.\n";
     const std::string* group = nullptr;

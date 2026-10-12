@@ -90,6 +90,22 @@ struct LightTarget
  */
 LightTarget lightTargetFor(const Telemetry* telemetry, const LightTuning& tuning);
 
+class Settings;
+class StatusBoard;
+
+/** The link's tunable values and live status, for a window that wants to show them. */
+struct LinkPanel
+{
+    Settings*             settings = nullptr;
+    StatusBoard*          status   = nullptr;
+    std::filesystem::path settingsFile;
+};
+
+/** Registers every setting the link has, at its default. For the link itself and for anything that draws them without one. */
+void registerLinkSettings(Settings& settings);
+/** Registers the status items the link publishes. */
+void registerLinkStatus(StatusBoard& status);
+
 struct LinkOptions
 {
     std::filesystem::path telemetryPath;
@@ -114,6 +130,12 @@ struct LinkOptions
      * once before onStarted is called, and again whenever either changes.
      */
     std::function<void(bool check, bool prereleases)> onUpdateSettings;
+    /**
+     * If set, called with the panel once the link is up, and with null just before the objects it
+     * points to go away. Whatever was given the panel must have let go of it by the time the
+     * second call returns.
+     */
+    std::function<void(const LinkPanel* panel)> onPanel;
     /**
      * If set, called on every pass of the loop and between the steps of its orderly end, for a
      * guard that wants to know the loop is still going (see stall_guard.hpp).

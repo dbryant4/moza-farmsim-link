@@ -45,7 +45,7 @@ link lets go of the yoke, is replaced, and starts again within a few seconds. No
 downloaded or installed until you pick it, so it never happens under you while driving.
 
 - **Check for updates** in the same menu asks straight away.
-- *Look for new versions* on the settings page turns the daily check off.
+- *Look for new versions* in the settings, under *Updates*, turns the daily check off.
 - *Include pre-releases* (off by default) also offers pre-releases: tries at the next version,
   newer and less tested, numbered like `0.1.3-pre1`. Turning it off again does not go back to an
   older version; you stay on what you have until a newer finished version is out.
@@ -60,20 +60,25 @@ downloaded or installed until you pick it, so it never happens under you while d
    them is running, because it resets the yoke's force effects when it starts.
 2. Start **MOZA FS25 Link** from the Start menu (`moza_fs_link.exe`). No window opens: a steering-wheel icon appears by the clock and
    the yoke gets a light centering force. On Windows 11 new icons start in the `^` overflow next
-   to the clock; drag it out to keep it in view. **Click the icon** to open the settings page,
-   http://127.0.0.1:8777/.
+   to the clock; drag it out to keep it in view. **Click the icon** to open the settings window.
 3. Start FS25 and tick **MOZA Yoke Link** in the mod list when you load your savegame.
-4. Get in a vehicle. The settings page should say **live, driving**.
-5. Tune with the sliders; changes apply immediately. **Save** keeps them for next time.
+4. Get in a vehicle. The top of the settings window should say **Game: live, driving**.
+5. Tune with the sliders; changes apply immediately. **Save** keeps them for next time. The list
+   on the left picks a group of settings; *Live status* shows what the game is reporting and what
+   the link is doing with it. Point at a setting to read what it does.
 6. **Export** downloads the settings as they are now as a file, `moza-fs-link-settings.ini`, to
    keep as a backup or pass to someone else. **Import** loads such a file: the values it holds take
    effect at once and count as unsaved changes, so **Revert** undoes an import and **Save** keeps
    it. Settings the file does not mention are left as they are.
 
-To stop, right-click the icon and choose **Exit**. **Release forces** on the settings page drops
+To stop, right-click the icon and choose **Exit**. **Release forces** in the settings window drops
 every force without stopping the bridge. To have it start with Windows, run the installer again
 and tick **Start with Windows** (or put a shortcut to `moza_fs_link.exe` in the Startup folder:
 press Win+R and enter `shell:startup`).
+
+The settings can also be had as a web page, for looking in from another device on the same PC's
+browser or for troubleshooting: start `moza_fs_link.exe --web-ui` and open http://127.0.0.1:8777/.
+It is off unless asked for.
 
 If it cannot start (no yoke found, a flight simulator running, MOZA Cockpit not running) it says
 so in a message box. What it prints goes to `moza_fs_bridge.log` beside the program.
@@ -88,8 +93,8 @@ it is a motor, and the test options move it on their own.
 - **Surfaces:** each kind of ground has its own feel: gravel a fast gritty buzz, grass and snow low
   and soft, a sown field medium and steady, a ploughed or cultivated one slow and lumpy, ridges a
   pulse per ridge. The *Surfaces* group has a strength for each, and *Tug on broken ground* for
-  the small pulls on the wheel on rough fields. Asphalt starts at nothing. The page shows which
-  surface the game reports under *Game > Surface*. *A different feel for each surface* switches
+  the small pulls on the wheel on rough fields. Asphalt starts at nothing. *Live status* shows which
+  surface the game reports. *A different feel for each surface* switches
   it all back to one plain rumble.
 - **Engine start:** *Engine start shake* sets how hard the wheel shakes while a combustion engine
   is being started. Electric vehicles have no engine vibration at all, only the ground's.
@@ -106,7 +111,7 @@ it is a motor, and the test options move it on their own.
 - **Status stays "waiting for the game":** the mod is not running. Check that it is ticked for the
   savegame, and look for lines starting `[MozaYokeLink]` in
   `Documents\My Games\FarmingSimulator2025\log.txt`.
-- **Forces disappear mid-drive:** switch *Forces* off and on again on the settings page.
+- **Forces disappear mid-drive:** untick and tick *Forces on* at the top of the settings window.
 - **"MOZA FS25 link restarted itself":** MOZA's SDK had stopped answering, which it has been seen to
   do, and the only cure is a fresh start, so the link gives itself one; forces are back within
   about fifteen seconds. If it happens often, try with *Lights follow the engine* off, and restart

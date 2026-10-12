@@ -293,7 +293,7 @@ Section /o "Desktop shortcut" SecDesktop
 SectionEnd
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
-  !insertmacro MUI_DESCRIPTION_TEXT ${SecApp} "The program itself: it sits as an icon by the clock and serves its settings page."
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecApp} "The program itself: it sits as an icon by the clock, and a click on the icon opens its settings."
   !insertmacro MUI_DESCRIPTION_TEXT ${SecMod} "The FS25 mod that tells the program what the vehicle is doing. Enable it for your savegame in the game's mod list."
   !insertmacro MUI_DESCRIPTION_TEXT ${SecStartup} "Start ${APP_NAME} whenever you sign in to Windows."
   !insertmacro MUI_DESCRIPTION_TEXT ${SecDesktop} "A shortcut on the desktop."
@@ -353,6 +353,7 @@ Section "Uninstall"
   Delete "$INSTDIR\moza_fs_bridge.log"
   Delete "$INSTDIR\devsdk.log"
   Delete "$INSTDIR\yoke_lights_original.txt"
+  Delete "$INSTDIR\moza_fs_link_stuck.dmp"
   Delete "$INSTDIR\uninstall.exe"
 
   ${IfNot} ${Silent}
