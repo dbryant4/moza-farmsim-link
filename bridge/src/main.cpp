@@ -1238,7 +1238,8 @@ void rememberOwnArguments()
     for (int i = 1; i < count; ++i)
     {
         const std::wstring argument = all[i];
-        if (argument == L"--restarted" || argument == L"--after-pid")
+        // Its own two, and the test option that froze it: a copy started again must not freeze by design.
+        if (argument == L"--restarted" || argument == L"--after-pid" || argument == L"--test-stall-after")
         {
             ++i;
             continue;
