@@ -12,6 +12,8 @@ yoke's roll axis used as steering.
 
 Version 0.1.3. Built for and tested on a MOZA AY210 yoke base with FS25 1.24 on Windows 11.
 
+**Website:** <https://dbryant4.github.io/moza-farmsim-link/> (the page is `docs/index.html`, served by GitHub Pages from `docs/`).
+
 **To just use it**, run the installer from the [latest release](https://github.com/dbryant4/moza-farmsim-link/releases/latest) and follow [docs/INSTALL.md](docs/INSTALL.md). It keeps itself up to date from there: when a newer release is published here, the icon by the clock offers to install it.
 
 ## Status

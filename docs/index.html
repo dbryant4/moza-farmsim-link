@@ -1,0 +1,612 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MOZA FS25 Link: force feedback for Farming Simulator 25 on a MOZA flight yoke</title>
+<meta name="description" content="Feel the field. An unofficial, open-source link that gives Farming Simulator 25 real force feedback on a MOZA flight yoke: steering weight, a different rumble for every surface, bumps, engine and the machine's own movement.">
+<meta property="og:title" content="MOZA FS25 Link">
+<meta property="og:description" content="Force feedback for Farming Simulator 25 on a MOZA flight yoke. Unofficial and open source.">
+<meta property="og:type" content="website">
+<link rel="icon" href="assets/icon.png">
+<style>
+:root {
+  --soil: #0d120e;
+  --soil-2: #131a14;
+  --furrow: #1b251c;
+  --line: #2a382b;
+  --leaf: #8fd694;
+  --wheat: #f3b53f;
+  --wheat-ink: #1b1403;
+  --text: #e9efe6;
+  --muted: #9fb0a0;
+  --warn: #ffcf7a;
+  --radius: 18px;
+  --wrap: 1120px;
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0; background: var(--soil); color: var(--text);
+  font: 17px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
+}
+a { color: var(--leaf); text-underline-offset: 3px; }
+a:hover { color: #b9efbd; }
+.wrap { max-width: var(--wrap); margin: 0 auto; padding: 0 22px; }
+h1, h2, h3 { line-height: 1.1; letter-spacing: -0.02em; margin: 0; text-wrap: balance; }
+h2 { font-size: clamp(30px, 4.4vw, 46px); }
+h3 { font-size: 20px; letter-spacing: -0.01em; }
+p { margin: 0; }
+.eyebrow { font-size: 13px; font-weight: 700; letter-spacing: 0.16em; text-transform: uppercase; color: var(--wheat); }
+.lead { font-size: clamp(18px, 2.1vw, 21px); color: var(--muted); max-width: 62ch; }
+
+/* ---- top bar ---- */
+header.top { position: sticky; top: 0; z-index: 10; backdrop-filter: blur(10px); background: color-mix(in srgb, var(--soil) 82%, transparent); border-bottom: 1px solid var(--line); }
+.top .wrap { display: flex; align-items: center; gap: 18px; height: 60px; }
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 750; letter-spacing: -0.01em; color: var(--text); text-decoration: none; }
+.brand img { width: 28px; height: 28px; border-radius: 7px; }
+.top nav { margin-left: auto; display: flex; gap: 22px; font-size: 15px; }
+.top nav a { color: var(--muted); text-decoration: none; }
+.top nav a:hover { color: var(--text); }
+@media (max-width: 720px) { .top nav a:not(.keep) { display: none; } }
+
+/* ---- hero ---- */
+.hero { position: relative; overflow: hidden; border-bottom: 1px solid var(--line); }
+.hero::before {
+  /* furrows running to the horizon */
+  content: ""; position: absolute; inset: auto -20% -42% -20%; height: 78%;
+  background: repeating-linear-gradient(90deg, transparent 0 46px, color-mix(in srgb, var(--leaf) 9%, transparent) 46px 48px);
+  transform: perspective(520px) rotateX(63deg); transform-origin: 50% 100%;
+  mask-image: linear-gradient(to top, #000 10%, transparent 82%);
+}
+.hero::after { content: ""; position: absolute; inset: 0; background: radial-gradient(900px 420px at 72% 8%, color-mix(in srgb, var(--wheat) 16%, transparent), transparent 70%); pointer-events: none; }
+.hero .wrap { position: relative; z-index: 1; display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 40px; align-items: center; padding-top: 84px; padding-bottom: 128px; }
+.hero h1 { font-size: clamp(46px, 8.2vw, 96px); font-weight: 800; letter-spacing: -0.045em; }
+.hero h1 em { font-style: normal; color: var(--wheat); }
+.hero .lead { margin-top: 22px; }
+.cta { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 30px; align-items: center; }
+.btn { display: inline-flex; align-items: center; gap: 10px; padding: 14px 22px; border-radius: 999px; font-weight: 700; text-decoration: none; border: 1px solid var(--line); color: var(--text); background: var(--soil-2); transition: transform .15s, border-color .15s, background .15s; }
+.btn:hover { transform: translateY(-1px); border-color: var(--muted); color: var(--text); }
+.btn.primary { background: var(--wheat); border-color: var(--wheat); color: var(--wheat-ink); }
+.btn.primary:hover { background: #ffc85a; color: var(--wheat-ink); }
+.fine { margin-top: 16px; font-size: 14px; color: var(--muted); }
+.fine b { color: var(--text); font-weight: 650; }
+@media (max-width: 900px) { .hero .wrap { grid-template-columns: 1fr; padding-top: 56px; padding-bottom: 96px; } }
+
+/* the tractor, trundling along the bottom of the hero */
+.lane { position: absolute; left: 0; right: 0; bottom: 14px; height: 84px; z-index: 1; pointer-events: none; overflow: hidden; }
+.lane::after { content: ""; position: absolute; left: 0; right: 0; bottom: 6px; height: 1px; background: linear-gradient(90deg, transparent, var(--line) 12%, var(--line) 88%, transparent); }
+.tractor { position: absolute; bottom: 7px; left: 6%; width: 132px; height: auto; overflow: visible; animation: drive 70s linear infinite; }
+@keyframes drive { from { left: -150px; } to { left: 100%; } }
+.tractor #rig { transform-origin: 96px 118px; will-change: transform; }
+.tractor .tyre { fill: #121812; stroke: #39473a; stroke-width: 3; }
+.tractor .tread { fill: none; stroke: #55655a; stroke-width: 5; stroke-dasharray: 5 9; }
+.tractor .rim { fill: var(--wheat); }
+.tractor .nut { fill: #1b1403; }
+.tractor .wheel { transform-box: fill-box; transform-origin: center; animation: roll 2.6s linear infinite; }
+.tractor .wheel.front { animation-duration: 1.65s; }
+@keyframes roll { to { transform: rotate(360deg); } }
+.tractor .body { fill: var(--leaf); }
+.tractor .body-dark { fill: #5fa866; }
+.tractor .cab { fill: #1a221b; stroke: #4b5a4c; stroke-width: 3; stroke-linejoin: round; }
+.tractor .glass { fill: color-mix(in srgb, var(--leaf) 22%, #0d120e); }
+.tractor .stack { fill: #39473a; }
+.tractor .lamp { fill: var(--wheat); }
+@media (max-width: 900px) { .lane { height: 66px; } .tractor { width: 100px; } }
+@media (prefers-reduced-motion: reduce) { .tractor, .tractor .wheel { animation: none; } }
+
+/* the yoke */
+.yoke-stage { display: grid; place-items: center; }
+.yoke { width: min(100%, 470px); filter: drop-shadow(0 30px 50px rgba(0,0,0,.55)); overflow: visible; }
+.yoke .base { fill: #151c16; stroke: #3c4a3d; stroke-width: 3; }
+.yoke .base-face { fill: #1d261e; }
+.yoke .vent { stroke: #2f3b30; stroke-width: 4; stroke-linecap: round; }
+.yoke .led { fill: var(--leaf); }
+.yoke .shaft { fill: #2a342b; stroke: #4b5a4c; stroke-width: 2; }
+.yoke .collar { fill: #1a221b; stroke: #4b5a4c; stroke-width: 3; }
+.yoke #handle { transform-origin: 240px 172px; will-change: transform; }
+.yoke .bar { fill: none; stroke: #2b352c; stroke-width: 34; stroke-linecap: round; stroke-linejoin: round; }
+.yoke .bar-hi { fill: none; stroke: #55655a; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; opacity: .7; }
+.yoke .grip { fill: none; stroke: var(--wheat); stroke-width: 34; stroke-linecap: round; }
+.yoke .grip-line { stroke: rgba(27,20,3,.35); stroke-width: 3; stroke-linecap: round; }
+.yoke .hub { fill: #1a221b; stroke: #4b5a4c; stroke-width: 3; }
+.yoke .hat { fill: #0d120e; stroke: #55655a; stroke-width: 2; }
+.yoke .button { fill: #55655a; }
+
+/* ---- sections ---- */
+section { padding: 88px 0; border-bottom: 1px solid var(--line); }
+section.alt { background: var(--soil-2); }
+.head { display: grid; gap: 14px; margin-bottom: 42px; }
+
+/* surface demo */
+.demo { display: grid; grid-template-columns: 300px 1fr; gap: 26px; align-items: stretch; }
+.surfaces { display: grid; gap: 8px; align-content: start; }
+.surface { display: flex; align-items: center; gap: 12px; width: 100%; text-align: left; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--line); background: transparent; color: var(--text); font: inherit; cursor: pointer; transition: background .15s, border-color .15s; }
+.surface:hover { border-color: var(--muted); }
+.surface[aria-pressed="true"] { background: var(--furrow); border-color: var(--leaf); }
+.surface i { width: 12px; height: 12px; border-radius: 50%; flex: none; }
+.surface small { display: block; color: var(--muted); font-size: 13.5px; line-height: 1.35; }
+.scope { border: 1px solid var(--line); border-radius: var(--radius); background: #090d0a; padding: 18px; display: grid; gap: 14px; grid-template-rows: 1fr auto; min-height: 330px; }
+/* The canvas fills a box of its own and is taken out of the layout: a canvas's pixel size counts as
+   its natural size, so one that sizes itself from its box and also props that box open grows for ever. */
+.scope .screen { position: relative; min-height: 230px; }
+.scope canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; border-radius: 10px; }
+.speed { display: flex; align-items: center; gap: 14px; color: var(--muted); font-size: 15px; }
+.speed input { flex: 1; accent-color: var(--wheat); }
+.speed output { color: var(--text); font-variant-numeric: tabular-nums; min-width: 78px; text-align: right; }
+@media (max-width: 860px) { .demo { grid-template-columns: 1fr; } .surfaces { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 520px) { .surfaces { grid-template-columns: 1fr; } }
+
+/* feature cards */
+.cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+.card { border: 1px solid var(--line); border-radius: var(--radius); padding: 24px; background: color-mix(in srgb, var(--soil-2) 70%, transparent); display: grid; gap: 10px; align-content: start; }
+section.alt .card { background: var(--soil); }
+.card p { color: var(--muted); font-size: 16px; }
+.card .glyph { width: 38px; height: 38px; color: var(--wheat); }
+.tag { justify-self: start; font-size: 12px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--warn); border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent); padding: 3px 9px; border-radius: 999px; }
+@media (max-width: 900px) { .cards { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 600px) { .cards { grid-template-columns: 1fr; } }
+
+/* how it works */
+.flow { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+.step { padding: 28px; display: grid; gap: 10px; align-content: start; border-right: 1px solid var(--line); background: var(--soil); }
+.step:last-child { border-right: 0; }
+.step .n { font-size: 13px; font-weight: 800; letter-spacing: .14em; color: var(--leaf); }
+.step p { color: var(--muted); font-size: 16px; }
+.step code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13.5px; }
+.line { margin-top: 18px; padding: 14px 16px; border-radius: 12px; border: 1px dashed var(--line); color: var(--muted); overflow-x: auto; white-space: nowrap; }
+.line b { color: var(--wheat); font-weight: 600; }
+@media (max-width: 860px) { .flow { grid-template-columns: 1fr; } .step { border-right: 0; border-bottom: 1px solid var(--line); } .step:last-child { border-bottom: 0; } }
+
+/* screenshot */
+.shot { display: grid; grid-template-columns: 0.8fr 1.2fr; gap: 40px; align-items: center; }
+.shot figure { margin: 0; border-radius: 14px; overflow: hidden; border: 1px solid var(--line); box-shadow: 0 30px 70px rgba(0,0,0,.5); background: #fff; }
+.shot img { display: block; width: 100%; height: auto; }
+.shot ul { margin: 18px 0 0; padding: 0; list-style: none; display: grid; gap: 10px; color: var(--muted); }
+.shot li { padding-left: 26px; position: relative; }
+.shot li::before { content: ""; position: absolute; left: 0; top: .62em; width: 14px; height: 2px; background: var(--wheat); }
+@media (max-width: 900px) { .shot { grid-template-columns: 1fr; } }
+
+/* install */
+.install { display: grid; grid-template-columns: 1fr 1fr; gap: 26px; }
+.panel { border: 1px solid var(--line); border-radius: var(--radius); padding: 28px; background: var(--soil); }
+.panel h3 { margin-bottom: 14px; }
+.panel ol, .panel ul { margin: 0; padding-left: 22px; color: var(--muted); display: grid; gap: 10px; }
+.panel li::marker { color: var(--wheat); font-weight: 700; }
+.panel b { color: var(--text); font-weight: 650; }
+@media (max-width: 860px) { .install { grid-template-columns: 1fr; } }
+
+.notice { margin-top: 26px; padding: 18px 20px; border-radius: 14px; border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent); background: color-mix(in srgb, var(--warn) 7%, transparent); color: var(--muted); font-size: 16px; }
+.notice b { color: var(--warn); }
+
+footer { padding: 46px 0 70px; color: var(--muted); font-size: 14.5px; }
+footer .wrap { display: grid; gap: 10px; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } .btn { transition: none; } }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="#top"><img src="assets/icon.png" alt="" width="28" height="28">MOZA FS25 Link</a>
+    <nav>
+      <a href="#feel">The feel</a>
+      <a href="#features">Features</a>
+      <a href="#how">How it works</a>
+      <a href="#install">Install</a>
+      <a class="keep" href="https://github.com/dbryant4/moza-farmsim-link">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+<div class="hero">
+  <div class="wrap">
+    <div>
+      <p class="eyebrow">Force feedback for Farming Simulator 25</p>
+      <h1>Feel the <em>field.</em></h1>
+      <p class="lead">Farming Simulator 25 on a MOZA flight yoke, with the yoke as your steering wheel and real forces behind it: the weight of the load, gravel under the tyres, a log under one wheel, the engine catching.</p>
+      <div class="cta">
+        <a class="btn primary" id="download" href="https://github.com/dbryant4/moza-farmsim-link/releases/latest">Download for Windows <span data-release="stable"></span></a>
+        <a class="btn" href="https://github.com/dbryant4/moza-farmsim-link">View the source</a>
+      </div>
+      <p class="fine" id="preNote" hidden>Trying things early? <a id="preLink" href="https://github.com/dbryant4/moza-farmsim-link/releases">Pre-release <span data-release="pre"></span></a> is out.</p>
+      <p class="fine"><b>Free and open source.</b> Unofficial: not made by, or connected with, MOZA or GIANTS Software.</p>
+    </div>
+    <div class="yoke-stage" aria-hidden="true">
+      <svg class="yoke" viewBox="0 0 480 400">
+        <!-- the base: the box on the desk that the yoke's shaft runs into -->
+        <rect class="base" x="130" y="232" width="220" height="140" rx="22"/>
+        <rect class="base-face" x="146" y="248" width="188" height="108" rx="14"/>
+        <line class="vent" x1="170" y1="322" x2="230" y2="322"/>
+        <line class="vent" x1="170" y1="336" x2="230" y2="336"/>
+        <circle class="led" cx="306" cy="330" r="5"/>
+        <rect class="shaft" x="218" y="178" width="44" height="92" rx="10"/>
+        <circle class="collar" cx="240" cy="270" r="34"/>
+        <!-- the handle: it is this that turns and shakes -->
+        <g id="handle">
+          <path class="bar" d="M 70 52 L 70 128 Q 70 172 114 172 L 366 172 Q 410 172 410 128 L 410 52"/>
+          <path class="bar-hi" d="M 58 56 L 58 128 Q 58 184 114 184"/>
+          <path class="grip" d="M 70 54 L 70 122"/>
+          <path class="grip" d="M 410 54 L 410 122"/>
+          <line class="grip-line" x1="58" y1="72" x2="82" y2="72"/>
+          <line class="grip-line" x1="58" y1="88" x2="82" y2="88"/>
+          <line class="grip-line" x1="58" y1="104" x2="82" y2="104"/>
+          <line class="grip-line" x1="398" y1="72" x2="422" y2="72"/>
+          <line class="grip-line" x1="398" y1="88" x2="422" y2="88"/>
+          <line class="grip-line" x1="398" y1="104" x2="422" y2="104"/>
+          <circle class="hat" cx="118" cy="150" r="11"/>
+          <circle class="hat" cx="362" cy="150" r="11"/>
+          <circle class="button" cx="150" cy="172" r="5"/>
+          <circle class="button" cx="330" cy="172" r="5"/>
+          <rect class="hub" x="192" y="140" width="96" height="64" rx="18"/>
+          <circle class="led" cx="240" cy="172" r="6"/>
+        </g>
+      </svg>
+    </div>
+  </div>
+  <!-- a tractor on the horizon: what all of this is for -->
+  <div class="lane" aria-hidden="true">
+    <svg class="tractor" viewBox="0 0 220 140">
+      <g id="rig">
+        <rect class="stack" x="150" y="26" width="7" height="34" rx="3"/>
+        <path class="cab" d="M 50 66 L 60 16 L 110 16 L 118 66 Z"/>
+        <path class="glass" d="M 66 24 L 104 24 L 110 60 L 58 60 Z"/>
+        <rect class="cab" x="52" y="8" width="66" height="10" rx="4"/>
+        <rect class="body" x="100" y="60" width="92" height="36" rx="9"/>
+        <rect class="body-dark" x="64" y="88" width="122" height="14" rx="5"/>
+        <path class="body" d="M 18 92 Q 22 48 62 46 Q 100 48 106 92 L 92 92 Q 88 62 62 60 Q 36 62 32 92 Z"/>
+        <rect class="lamp" x="186" y="68" width="7" height="9" rx="2"/>
+        <g class="wheel">
+          <circle class="tyre" cx="62" cy="98" r="38"/>
+          <circle class="tread" cx="62" cy="98" r="32"/>
+          <circle class="rim" cx="62" cy="98" r="15"/>
+          <circle class="nut" cx="62" cy="98" r="4"/>
+          <rect class="nut" x="60" y="85" width="4" height="8" rx="2"/>
+        </g>
+        <g class="wheel front">
+          <circle class="tyre" cx="168" cy="112" r="24"/>
+          <circle class="tread" cx="168" cy="112" r="19"/>
+          <circle class="rim" cx="168" cy="112" r="9"/>
+          <circle class="nut" cx="168" cy="112" r="3"/>
+          <rect class="nut" x="166.5" y="104" width="3" height="6" rx="1.5"/>
+        </g>
+      </g>
+    </svg>
+  </div>
+</div>
+
+<section id="feel">
+  <div class="wrap">
+    <div class="head">
+      <p class="eyebrow">Every surface has its own feel</p>
+      <h2>Not one rumble, turned up and down.</h2>
+      <p class="lead">The game knows what each wheel is standing on. The link gives every kind of ground its own pattern: how fast it shakes, how lumpy it is, whether it pulses. Pick a surface and a speed to see the vibration it sends to the yoke.</p>
+    </div>
+    <div class="demo">
+      <div class="surfaces" id="surfaces" role="group" aria-label="Surface"></div>
+      <div class="scope">
+        <div class="screen"><canvas id="scope" role="img" aria-label="Vibration pattern for the chosen surface"></canvas></div>
+        <label class="speed">Speed <input type="range" id="speed" min="2" max="40" value="16" step="1"><output id="speedOut">16 km/h</output></label>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="features" class="alt">
+  <div class="wrap">
+    <div class="head">
+      <p class="eyebrow">What you feel</p>
+      <h2>A tractor's steering, as far as a yoke can say it.</h2>
+    </div>
+    <div class="cards">
+      <div class="card">
+        <svg class="glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 12v9M12 12 4 14M12 12l8 2"/></svg>
+        <h3>Steering with weight</h3>
+        <p>Centering that builds with speed, weight that grows with the load, a self-aligning pull that goes light when the wheels slip, and an extra drag while an implement works the ground.</p>
+      </div>
+      <div class="card">
+        <svg class="glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M2 14c2-5 3 5 5 0s3 5 5 0 3 5 5 0 3 5 5 0"/></svg>
+        <h3>Surfaces</h3>
+        <p>Gravel buzzes, grass and snow are low and soft, a sown field is steady, a ploughed one comes clod by clod and ridges pulse as you cross them. Each has its own strength slider.</p>
+      </div>
+      <div class="card">
+        <svg class="glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17h5l3-9 3 13 2-4h5"/></svg>
+        <h3>Bumps and kicks</h3>
+        <p>A log under the left wheel jerks the wheel to the left. Rail tracks under both give a thump and a wiggle. A twenty-tonne machine shrugs off what throws a small one about.</p>
+      </div>
+      <div class="card">
+        <svg class="glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="8" width="13" height="9" rx="2"/><path d="M17 11h3v4h-3M8 8V5h5v3M2 12h2"/></svg>
+        <h3>The engine</h3>
+        <p>A shake as the engine turns over and catches, then a vibration that follows it: slow at idle, quicker and stronger with the revs. Electric machines stay silent, as they should.</p>
+      </div>
+      <div class="card">
+        <svg class="glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 16c3-6 6 2 8-3s4-1 8-5"/><path d="M4 20h16"/></svg>
+        <h3>The machine's own movement</h3>
+        <p>Off road the cab rocks and bounces against the horizon. The wheel is pushed with the rocking and the yoke moves in and out with the pitching.</p>
+        <span class="tag" data-since="0.1.3">Newer than the latest release</span>
+      </div>
+      <div class="card">
+        <svg class="glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M4 20h16"/></svg>
+        <h3>Installs and updates itself</h3>
+        <p>An installer, an icon by the clock, and updates offered in its menu when a new release is published here. Nothing is downloaded or installed until you pick it.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="settings">
+  <div class="wrap shot">
+    <div>
+      <p class="eyebrow">Tune it while you drive</p>
+      <h2 style="margin-top:14px">Every force has a slider.</h2>
+      <p class="lead" style="margin-top:16px">Changes take effect the moment you make them, so you can feel the difference with the tractor still rolling.</p>
+      <ul>
+        <li>A page per group of forces, and a live view of what the game is reporting.</li>
+        <li>One switch turns every force off, and one button lets go of the yoke at once.</li>
+        <li>Export your settings to a file, or import someone else's.</li>
+      </ul>
+      <p class="fine" data-since="0.1.3" data-note="window">The settings window shown may be newer than the latest release, which has the same settings as a page in your browser.</p>
+    </div>
+    <figure><img src="assets/settings-window.png" width="1320" height="915" loading="lazy" alt="The settings window: a list of pages on the left and, for the Rumble page, a slider and a number for each setting, with Export, Import, Defaults, Revert and Save along the bottom."></figure>
+  </div>
+</section>
+
+<section id="how" class="alt">
+  <div class="wrap">
+    <div class="head">
+      <p class="eyebrow">How it works</p>
+      <h2>Two small parts and one line of text.</h2>
+      <p class="lead">Farming Simulator sends a steering wheel almost nothing. So a mod inside the game says what the machine is doing, and a small program turns that into forces.</p>
+    </div>
+    <div class="flow">
+      <div class="step"><span class="n">1 &nbsp; THE MOD</span><h3>Reads the machine</h3><p>A Lua mod in the game reads speed, steering, mass, engine, the ground under each wheel and how the body is moving, up to sixty times a second.</p></div>
+      <div class="step"><span class="n">2 &nbsp; THE LINK</span><h3>Turns it into forces</h3><p>A program by the clock works out what the steering should feel like and how it should shake, smoothing every change so nothing jumps.</p></div>
+      <div class="step"><span class="n">3 &nbsp; THE YOKE</span><h3>Pushes back</h3><p>The forces go to the base through MOZA's own SDK as temporary effects. They vanish when the link stops; no setting on the base is ever changed.</p></div>
+    </div>
+    <p class="line mono">MOZAFS 1 seq=4821 <b>speed</b>=5.42 <b>steer</b>=-0.250 <b>mass</b>=8200 <b>rpm</b>=1450 <b>rough</b>=0.70 <b>surface</b>=6 <b>bumpl</b>=0.00 <b>bumpr</b>=0.00 end=1</p>
+  </div>
+</section>
+
+<section id="install">
+  <div class="wrap">
+    <div class="head">
+      <p class="eyebrow">Get it</p>
+      <h2>Up and driving in a few minutes.</h2>
+    </div>
+    <div class="install">
+      <div class="panel">
+        <h3>What you need</h3>
+        <ul>
+          <li>A <b>MOZA force-feedback flight base</b>. Built for and tested on the AY210; other MOZA flight bases use the same commands but are untested.</li>
+          <li><b>MOZA Cockpit</b>, installed and running.</li>
+          <li><b>Farming Simulator 25</b> on Windows.</li>
+          <li><b>MOZA's Flight SDK</b>, a free download from <a href="https://mozaracing.com/pages/sdk">MOZA's SDK page</a>. One file from it is needed; the installer takes it from the zip.</li>
+        </ul>
+      </div>
+      <div class="panel">
+        <h3>Install</h3>
+        <ol>
+          <li>Download the <b>Flight SDK</b> zip from MOZA. Leave it zipped.</li>
+          <li>Run the installer from the <a href="https://github.com/dbryant4/moza-farmsim-link/releases/latest">latest release<span data-release="stable" data-before=" (" data-after=")"></span></a> and point it to that zip when it asks.</li>
+          <li>In the game, bind steering to the yoke's roll axis and tick <b>MOZA Yoke Link</b> in the mod list for your savegame.</li>
+          <li>Start <b>MOZA FS25 Link</b>, get in a tractor and drive.</li>
+        </ol>
+      </div>
+    </div>
+    <p class="notice"><b>Good to know.</b> This is one person's project, tested on one setup: an AY210 base, Farming Simulator 25 version 1.24 and Windows 11. The installer is not code-signed, so Windows asks before running it. The link will not start while X-Plane, Microsoft Flight Simulator, DCS or IL-2 is running, so it cannot get in the way of a flight. The full guide is in <a href="https://github.com/dbryant4/moza-farmsim-link/blob/main/docs/INSTALL.md">INSTALL.md</a>.</p>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>MOZA FS25 Link is free software under the <a href="https://github.com/dbryant4/moza-farmsim-link/blob/main/LICENSE">MIT licence</a>. Source, issues and releases are on <a href="https://github.com/dbryant4/moza-farmsim-link">GitHub</a>.</span>
+    <span>An unofficial project. MOZA is a trademark of its owner, and Farming Simulator is a trademark of GIANTS Software; neither is connected with it.</span>
+  </div>
+</footer>
+
+<script>
+(() => {
+'use strict';
+const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+// Every version number on this page comes from the project's releases on GitHub, asked for once
+// per visit. Nothing here names a version: when GitHub cannot be asked, the page reads sensibly
+// without any, and every link still goes to the right place.
+const REPO = 'dbryant4/moza-farmsim-link';
+
+/** "v0.1.3" or "v0.1.3-pre2" as numbers that sort: a finished version after all of its pre-releases. */
+function versionOf(tag) {
+  const m = /^v?(\d+)\.(\d+)\.(\d+)(?:-pre(\d+))?$/.exec(tag || '');
+  return m ? {text: tag.replace(/^v/, ''), base: m[1] + '.' + m[2] + '.' + m[3], key: [+m[1], +m[2], +m[3], m[4] ? +m[4] : Infinity], pre: !!m[4]} : null;
+}
+function newer(a, b) {
+  for (let i = 0; i < 4; i++) if (a.key[i] !== b.key[i]) return a.key[i] > b.key[i];
+  return false;
+}
+
+function showReleases(releases) {
+  let stable = null, pre = null;
+  for (const release of releases) {
+    const version = versionOf(release.tag_name);
+    if (!version || release.draft) continue;
+    const entry = {version, page: release.html_url, installer: (release.assets || []).find(a => /-setup\.exe$/.test(a.name))};
+    if (release.prerelease || version.pre) { if (!pre || newer(version, pre.version)) pre = entry; }
+    else if (!stable || newer(version, stable.version)) stable = entry;
+  }
+  // A pre-release is only worth a mention while it is ahead of the finished versions.
+  if (pre && stable && !newer(pre.version, stable.version)) pre = null;
+
+  const fill = (kind, text) => document.querySelectorAll('[data-release="' + kind + '"]').forEach(el => {
+    el.textContent = text ? (el.dataset.before || '') + text + (el.dataset.after || '') : '';
+  });
+  fill('stable', stable && stable.version.text);
+  fill('pre', pre && pre.version.text);
+
+  if (stable && stable.installer && stable.installer.browser_download_url.startsWith('https://github.com/' + REPO + '/releases/download/')) {
+    document.getElementById('download').href = stable.installer.browser_download_url;
+  }
+  if (pre) {
+    document.getElementById('preLink').href = pre.page;
+    document.getElementById('preNote').hidden = false;
+  }
+
+  // Things marked as arriving in a certain version: said to be in its pre-releases until that
+  // version is out, and not remarked on at all once it is.
+  document.querySelectorAll('[data-since]').forEach(el => {
+    const since = versionOf(el.dataset.since);
+    if (!since || !stable) return;
+    if (!newer(since, stable.version)) { el.hidden = true; return; }
+    el.textContent = el.dataset.note === 'window'
+      ? 'The settings window shown is from the ' + since.text + ' pre-releases. Version ' + stable.version.text + ' has the same settings as a page in your browser.'
+      : 'In the ' + since.text + ' pre-releases';
+  });
+}
+
+(() => {
+  const KEY = 'releases-v1', FRESH_MS = 10 * 60 * 1000;
+  try {
+    const kept = JSON.parse(sessionStorage.getItem(KEY) || 'null');
+    if (kept && Date.now() - kept.at < FRESH_MS) { showReleases(kept.list); return; }
+  } catch (e) { /* no storage: just ask */ }
+  fetch('https://api.github.com/repos/' + REPO + '/releases?per_page=30', {headers: {Accept: 'application/vnd.github+json'}})
+    .then(r => r.ok ? r.json() : null)
+    .then(list => {
+      if (!Array.isArray(list)) return;
+      // Kept small: only what the page reads.
+      const slim = list.map(r => ({tag_name: r.tag_name, draft: r.draft, prerelease: r.prerelease, html_url: r.html_url,
+                                   assets: (r.assets || []).map(a => ({name: a.name, browser_download_url: a.browser_download_url}))}));
+      showReleases(slim);
+      try { sessionStorage.setItem(KEY, JSON.stringify({at: Date.now(), list: slim})); } catch (e) { /* fine without */ }
+    })
+    .catch(() => {});
+})();
+
+// The same patterns the link uses (bridge/src/force_model.cpp): where in the band each surface
+// sits when slow and when fast, how lumpy it is, and whether it pulses as ridges pass.
+const SURFACES = [
+  {name: 'Asphalt',            note: 'Smooth. Nothing, unless you ask for a faint buzz.', color: '#7f8a82', strength: 0.06, from: 0.70, to: 1.00, grain: 0,    grainM: 0,   pulse: 0,   pulseM: 0},
+  {name: 'Gravel track',       note: 'Fast and gritty, rising with speed.',              color: '#c9b08a', strength: 0.55, from: 0.55, to: 1.00, grain: 0.35, grainM: 0.4, pulse: 0,   pulseM: 0},
+  {name: 'Grass',              note: 'Low and soft, in long swells.',                    color: '#8fd694', strength: 0.45, from: 0.10, to: 0.45, grain: 0.25, grainM: 2.0, pulse: 0,   pulseM: 0},
+  {name: 'Sown field',         note: 'Medium and steady.',                               color: '#d7c35a', strength: 0.75, from: 0.30, to: 0.70, grain: 0.20, grainM: 1.5, pulse: 0,   pulseM: 0},
+  {name: 'Ploughed field',     note: 'Slow and heavy, coming and going clod by clod.',   color: '#f3b53f', strength: 1.00, from: 0.00, to: 0.35, grain: 0.70, grainM: 1.2, pulse: 0,   pulseM: 0},
+  {name: 'Ridges',             note: 'A pulse for every ridge you cross.',               color: '#ff8f5a', strength: 0.90, from: 0.10, to: 0.40, grain: 0.20, grainM: 1.5, pulse: 0.8, pulseM: 0.75},
+];
+const BAND = [8, 25];   // Hz: the rumble's slow and fast ends
+
+let current = 4;
+const list = document.getElementById('surfaces');
+SURFACES.forEach((surface, index) => {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'surface';
+  button.setAttribute('aria-pressed', index === current ? 'true' : 'false');
+  const dot = document.createElement('i');
+  dot.style.background = surface.color;
+  const text = document.createElement('span');
+  const note = document.createElement('small');
+  note.textContent = surface.note;
+  text.append(surface.name, note);
+  button.append(dot, text);
+  button.addEventListener('click', () => {
+    current = index;
+    [...list.children].forEach((other, i) => other.setAttribute('aria-pressed', i === index ? 'true' : 'false'));
+    if (reduceMotion) draw(0);
+  });
+  list.append(button);
+});
+
+const speedInput = document.getElementById('speed');
+const speedOut = document.getElementById('speedOut');
+speedInput.addEventListener('input', () => { speedOut.textContent = speedInput.value + ' km/h'; if (reduceMotion) draw(0); });
+
+// One fixed pseudo-random value per whole number, eased between them: the lumps in the ground.
+function lattice(n) { const x = Math.sin(n * 127.1 + 311.7) * 43758.5453; return x - Math.floor(x); }
+function noise(x) { const i = Math.floor(x), f = x - i, u = f * f * (3 - 2 * f); return lattice(i) + (lattice(i + 1) - lattice(i)) * u; }
+
+/** Strength of the rumble at @p distance metres along the ground, 0..1, and its frequency. */
+function pattern(surface, speedMs, distance) {
+  const hzShare = Math.min(speedMs / 12, 1);
+  const hz = BAND[0] + (BAND[1] - BAND[0]) * (surface.from + (surface.to - surface.from) * hzShare);
+  const ease = Math.min(speedMs / 8, 1);
+  const level = surface.strength * ease * (2 - ease);
+  const lumps = surface.grain ? 1 - surface.grain * (1 - noise(distance / surface.grainM)) : 1;
+  const ridges = surface.pulse ? 1 - surface.pulse * (0.5 + 0.5 * Math.cos(2 * Math.PI * distance / surface.pulseM)) : 1;
+  return {hz, level: level * lumps * ridges};
+}
+
+const canvas = document.getElementById('scope');
+const context = canvas.getContext('2d');
+const handle = document.getElementById('handle');
+const rig = document.getElementById('rig');
+const WINDOW_S = 2.2;   // seconds of vibration shown across the canvas
+
+function draw(now) {
+  const ratio = Math.min(devicePixelRatio || 1, 2);
+  const width = canvas.clientWidth, height = canvas.clientHeight;
+  if (canvas.width !== Math.round(width * ratio) || canvas.height !== Math.round(height * ratio)) {
+    canvas.width = Math.round(width * ratio);
+    canvas.height = Math.round(height * ratio);
+  }
+  context.setTransform(ratio, 0, 0, ratio, 0, 0);
+  context.clearRect(0, 0, width, height);
+
+  const surface = SURFACES[current];
+  const speedMs = Number(speedInput.value) / 3.6;
+  const t0 = now / 1000;
+
+  // faint centre line and the envelope the ground gives the rumble
+  context.strokeStyle = 'rgba(159,176,160,.18)';
+  context.lineWidth = 1;
+  context.beginPath(); context.moveTo(0, height / 2); context.lineTo(width, height / 2); context.stroke();
+
+  const amplitude = height * 0.42;
+  const steps = Math.max(240, Math.floor(width * 1.5));
+  context.lineWidth = 2;
+  context.strokeStyle = surface.color;
+  context.beginPath();
+  let phase = 0, last = t0 - WINDOW_S;
+  for (let i = 0; i <= steps; i++) {
+    const t = t0 - WINDOW_S + (i / steps) * WINDOW_S;
+    const p = pattern(surface, speedMs, t * speedMs);
+    phase += 2 * Math.PI * p.hz * (t - last);
+    last = t;
+    const y = height / 2 - Math.sin(phase) * p.level * amplitude;
+    const x = (i / steps) * width;
+    if (i === 0) context.moveTo(x, y); else context.lineTo(x, y);
+  }
+  context.stroke();
+
+  context.fillStyle = 'rgba(233,239,230,.75)';
+  context.font = '13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+  const here = pattern(surface, speedMs, t0 * speedMs);
+  context.fillText(Math.round(here.hz) + ' Hz', 10, 20);
+
+  // The yoke in the hero does what the link does to a real one: it turns a little as if steered,
+  // and shakes with whatever is on the scope.
+  if (!reduceMotion) {
+    const shake = Math.sin(t0 * 2 * Math.PI * Math.min(here.hz, 14)) * here.level;
+    const steer = Math.sin(t0 * 0.55) * 7 + Math.sin(t0 * 0.21 + 1) * 4;
+    handle.style.transform = 'rotate(' + (steer + shake * 1.5).toFixed(3) + 'deg) translateY(' + (shake * 1.4).toFixed(2) + 'px)';
+    // ... and the tractor on the horizon rides over the same ground: the rougher it is, the more it bobs and rocks.
+    const rough = surface.strength * (0.35 + surface.grain + surface.pulse * 0.6);
+    const along = t0 * speedMs;
+    const bob = (noise(along / 1.3) - 0.5) * rough * 7;
+    const rock = (noise(along / 1.9 + 40) - 0.5) * rough * 5;
+    rig.style.transform = 'translateY(' + bob.toFixed(2) + 'px) rotate(' + rock.toFixed(2) + 'deg)';
+  }
+}
+
+if (reduceMotion) {
+  draw(0);
+  addEventListener('resize', () => draw(0));
+} else {
+  const frame = now => { draw(now); requestAnimationFrame(frame); };
+  requestAnimationFrame(frame);
+}
+})();
+</script>
+</body>
+</html>
