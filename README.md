@@ -22,7 +22,7 @@ Every part works on the real hardware, and the mod has been driven in the game:
 
 - **Bridge and yoke:** tested on the real AY210 (2026-10-05), including the whole chain driven by
   simulated telemetry: centering that grows with speed, weight, and rumble all reach the motors.
-- **Settings:** `moza_fs_link.exe` has a native settings window (`settings_window_win.cpp`), opened from the tray icon. It was drawn to an image on the PC and its controls worked by its own self-test there (`--render-settings`, `--selftest-settings`); nobody has yet used it by hand. The web page it replaces is still served by `moza_fs_bridge.exe`, and by the tray program with `--web-ui`; it was tested in a browser on the Mac.
+- **Settings:** `moza_fs_link.exe` has a native settings window (`settings_window_win.cpp`), opened from the tray icon, in everyday use by the owner. It can also be drawn to an image and have its controls worked unseen (`--render-settings`, `--selftest-settings`). The web page it replaces is still served by `moza_fs_bridge.exe`, and by the tray program with `--web-ui`; it was tested in a browser on the Mac.
 - **FS25 mod:** loads in FS25 1.24, writes telemetry about 60 times a second, and the bridge
   follows it live (first drive 2026-10-05). The individual values (slip, surface roughness,
   implement state) have only been spot-checked. `fs-mod/README.md` lists what to look for.
@@ -266,16 +266,18 @@ spring scale 34%, damper scale 20%, torque limit 100%).
 
 ## Still to find out
 
-0. **The installer and updates (new in 0.1.2).** Checked on the PC without a desktop: a silent
-   install with MOZA's Flight SDK 1.0.0.4 zip, an update over the top, a silent uninstall, and the
-   question to GitHub about the latest release. Not yet seen or run: the installer's pages, the
-   update entries in the icon's menu, and a whole update from one release to the next, which
-   needs two published releases with an installer attached. `moza_fs_bridge.exe --fetch-update`
-   downloads and verifies the latest release's installer without running it. MOZA's current
-   Flight SDK download is 1.0.0.6; only 1.0.0.4 has been used.
-0. **The rest of 0.1.2.** One session in FS25 (2026-10-11) showed the mod's side working: each
-   machine's own engine speed range, electric vehicles told apart, and wheel bumps detected. How
-   the forces feel, and the pitch sway on the real yoke, still need the owner's verdict:
+0. **What 0.1.3 has and has not been through.** The owner used every pre-release of it on the real
+   setup on 2026-10-11 and 12: installed 0.1.2 with the installer's wizard, took pre-releases 2 and
+   3 through the tray icon's menu, used the settings window by hand, and drove with pre4, which is
+   the same code as 0.1.3. In the game the mod was seen reporting each machine's engine speed
+   range and start time, electric vehicles, the kind of surface, wheel bumps and the machine's
+   movement. What that leaves open:
+   - MOZA's current Flight SDK download is 1.0.0.6; only 1.0.0.4 has been used.
+   - With *Lights follow the engine* on, MOZA's SDK locks up (see "What the hardware runs
+     showed"). The link recovers by restarting itself, but the setting is best left off.
+   - How the newer forces feel has not been judged one by one. They are listed below with what
+     each depends on.
+0. **The forces, one by one:**
    - *Engine start shake*, and no engine vibration for electric vehicles. The settings page shows
      what the mod reports under *Engine* (off, starting, running, electric).
    - *Obstacle kick*: the wheel jerks toward the side whose front wheel hits a log or kerb, less
@@ -291,13 +293,12 @@ spring scale 34%, damper scale 20%, torque limit 100%).
      (the settings page shows the reported surface under *Game*).
    - *Machine movement* (0.1.3): the mod reports how fast the machine's body is rocking, pitching
      and bouncing (`rollrate`, `pitchrate`, `heave`, from the root node's place and attitude on
-     each frame), and the bridge pushes the wheel and the yoke with it. Not yet run in the game:
-     whether the values are steady enough at the game's frame rate, which way round the pushes
-     should go, and how strong they should be are all first guesses.
+     each frame), and the bridge pushes the wheel and the yoke with it. The game does report the
+     values; which way round the pushes should go and how strong they should be are first guesses.
    - *Engine vibration* (0.1.3) follows the revs within each machine's own range, the load and
      the road speed, in strength and in frequency. The start shake lasts half of each machine's
-     own start, which the mod reads from `spec_motorized.motorStartDuration` (`startms`); that the
-     game fills that field in FS25 is taken from the FS22 source and not yet seen. Untried.
+     own start, which the mod reads from `spec_motorized.motorStartDuration` (`startms`); FS25
+     does fill it in (3.2 s and 3.5 s on the two machines looked at).
    - *Acceleration sway*: pitch leans out when pulling away and in when braking. Pitch has too
      much friction for a plain push, so a small position controller moves it; it is tuned against
      a simulated axis only.
@@ -307,13 +308,9 @@ spring scale 34%, damper scale 20%, torque limit 100%).
      one colour for all its lights and no per-hat control. Unlike the forces this writes values the
      handle stores; the bridge restores what it found when it stops, but whether each write wears
      the handle's memory is unknown, so writes are limited to step changes a few times a second.
-   - *The tray icon* has been checked on the PC only as far as a remote session can see (no
-     window, settings page up, second start and `--quit` behave); the icon and its menu have not
-     been looked at.
-0. **Bridge detection in the game (new in 0.1.1, not yet run in FS25).** With the bridge running,
-   FS25's `log.txt` should show `[MozaYokeLink] bridge detected` within a couple of seconds, and
-   `bridge gone` after the bridge stops. If it never appears, the mod simply leaves the game's
-   force feedback alone.
+0. **Nothing here can test whether force reaches the yoke.** The tests run against a stand-in for
+   MOZA's SDK that accepts every command, which is how 0.1.3-pre3 passed all of them and did
+   nothing on the real yoke. Hands on the yoke are the only check there is.
 
 1. **Tuning from real driving.** Default rumble is too weak to feel: it is capped at 30%, scales
    with speed up to 29 km/h, and goes through pitch, where friction swallows anything under about
