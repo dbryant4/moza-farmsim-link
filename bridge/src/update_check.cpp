@@ -1,7 +1,9 @@
 #include "update_check.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <limits>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -256,26 +258,80 @@ std::optional<Version> parseVersion(std::string_view text)
             text.remove_prefix(1);
         }
     }
-    return text.empty() ? std::optional<Version>(version) : std::nullopt;
-}
-
-std::optional<ReleaseInfo> parseLatestRelease(std::string_view json)
-{
-    Json root;
-    if (!Parser(json).parse(root) || root.kind != Json::Kind::Object || root.boolean("draft") || root.boolean("prerelease"))
+    if (text.empty())
+    {
+        return version;
+    }
+    // The one suffix there is: "-pre" and a whole number from 1 up.
+    constexpr std::string_view marker = "-pre";
+    if (text.substr(0, marker.size()) != marker)
     {
         return std::nullopt;
     }
-    const auto version = parseVersion(root.string("tag_name"));
+    text.remove_prefix(marker.size());
+    if (text.empty() || text.front() < '0' || text.front() > '9')
+    {
+        return std::nullopt;
+    }
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), version.pre);
+    if (error != std::errc() || end != text.data() + text.size() || version.pre < 1)
+    {
+        return std::nullopt;
+    }
+    return version;
+}
+
+std::strong_ordering Version::operator<=>(const Version& other) const
+{
+    if (const auto order = major <=> other.major; order != 0)
+    {
+        return order;
+    }
+    if (const auto order = minor <=> other.minor; order != 0)
+    {
+        return order;
+    }
+    if (const auto order = patch <=> other.patch; order != 0)
+    {
+        return order;
+    }
+    // The finished version comes after every pre-release of it.
+    const auto rank = [](int pre) { return pre == 0 ? std::numeric_limits<int>::max() : pre; };
+    return rank(pre) <=> rank(other.pre);
+}
+
+std::string Version::text() const
+{
+    std::string out = std::to_string(major) + "." + std::to_string(minor) + "." + std::to_string(patch);
+    if (pre != 0)
+    {
+        out += "-pre" + std::to_string(pre);
+    }
+    return out;
+}
+
+namespace {
+
+/** One release object of GitHub's API. Nothing for a draft or an entry whose tag is not a version. */
+std::optional<ReleaseInfo> readRelease(const Json& release)
+{
+    if (release.kind != Json::Kind::Object || release.boolean("draft"))
+    {
+        return std::nullopt;
+    }
+    const auto version = parseVersion(release.string("tag_name"));
     if (!version)
     {
         return std::nullopt;
     }
 
     ReleaseInfo info;
-    info.version = *version;
-    info.pageUrl = root.string("html_url");
-    if (const Json* assets = root.find("assets"); assets != nullptr && assets->kind == Json::Kind::Array)
+    info.version     = *version;
+    info.pageUrl     = release.string("html_url");
+    // Whatever GitHub's mark says at this moment, a "-preN" version is a pre-release.
+    info.prerelease  = release.boolean("prerelease") || version->pre != 0;
+    info.publishedAt = parseTimestamp(release.string("published_at")).value_or(0);
+    if (const Json* assets = release.find("assets"); assets != nullptr && assets->kind == Json::Kind::Array)
     {
         for (const Json& asset : assets->items)
         {
@@ -297,6 +353,93 @@ std::optional<ReleaseInfo> parseLatestRelease(std::string_view json)
         }
     }
     return info;
+}
+
+} // namespace
+
+std::optional<ReleaseInfo> parseLatestRelease(std::string_view json)
+{
+    Json root;
+    if (!Parser(json).parse(root))
+    {
+        return std::nullopt;
+    }
+    auto release = readRelease(root);
+    return release && !release->prerelease ? release : std::nullopt;
+}
+
+std::optional<ReleaseInfo> newestRelease(std::string_view json, bool includePrereleases)
+{
+    Json root;
+    if (!Parser(json).parse(root) || root.kind != Json::Kind::Array)
+    {
+        return std::nullopt;
+    }
+    std::optional<ReleaseInfo> newest;
+    for (const Json& item : root.items)
+    {
+        auto release = readRelease(item);
+        if (!release || (release->prerelease && !includePrereleases))
+        {
+            continue;
+        }
+        if (!newest || release->version > newest->version)
+        {
+            newest = std::move(release);
+        }
+    }
+    return newest;
+}
+
+std::optional<std::int64_t> parseTimestamp(std::string_view text)
+{
+    // Exactly YYYY-MM-DDTHH:MM:SSZ, which is the only form GitHub's API uses.
+    if (text.size() != 20 || text[4] != '-' || text[7] != '-' || text[10] != 'T' || text[13] != ':' || text[16] != ':' || text[19] != 'Z')
+    {
+        return std::nullopt;
+    }
+    const auto number = [&](std::size_t at, std::size_t length) -> std::optional<int> {
+        int value = 0;
+        for (std::size_t i = at; i < at + length; ++i)
+        {
+            if (text[i] < '0' || text[i] > '9')
+            {
+                return std::nullopt;
+            }
+            value = value * 10 + (text[i] - '0');
+        }
+        return value;
+    };
+    const auto year = number(0, 4), month = number(5, 2), day = number(8, 2), hour = number(11, 2), minute = number(14, 2),
+               second = number(17, 2);
+    if (!year || !month || !day || !hour || !minute || !second || *year < 1970 || *month < 1 || *month > 12 || *day < 1 || *day > 31 ||
+        *hour > 23 || *minute > 59 || *second > 60)
+    {
+        return std::nullopt;
+    }
+    // Days since 1970-01-01 in the Gregorian calendar, counting years from March so that the leap day comes last.
+    const std::int64_t y           = *year - (*month <= 2 ? 1 : 0);
+    const std::int64_t era         = y / 400;
+    const std::int64_t yearOfEra   = y - era * 400;
+    const std::int64_t dayOfYear   = (153 * (*month + (*month > 2 ? -3 : 9)) + 2) / 5 + *day - 1;
+    const std::int64_t dayOfEra    = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear;
+    const std::int64_t days        = era * 146097 + dayOfEra - 719468;
+    return days * 86400 + *hour * 3600 + *minute * 60 + *second;
+}
+
+std::int64_t secondsUntilSettled(const ReleaseInfo& release, std::int64_t nowSeconds)
+{
+    if (release.publishedAt <= 0)
+    {
+        return 0;
+    }
+    const std::int64_t age = nowSeconds - release.publishedAt;
+    // A clock set wrong by more than the wait itself must not hold an update back for ever.
+    if (age < -kReleaseSettleSeconds)
+    {
+        return 0;
+    }
+    return age >= kReleaseSettleSeconds ? 0 : kReleaseSettleSeconds - std::max<std::int64_t>(age, 0);
 }
 
 bool isReleaseDownload(std::string_view url, std::string_view repository)

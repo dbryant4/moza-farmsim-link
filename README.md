@@ -10,7 +10,7 @@ yoke's roll axis used as steering.
 | `docs/telemetry.md` | The telemetry file format both sides are built against. |
 | `sdk/` | Where the MOZA SDK goes. **Not included in this repository**; see "Getting the MOZA SDK". |
 
-Version 0.1.2. Built for and tested on a MOZA AY210 yoke base with FS25 1.24 on Windows 11.
+Version 0.1.3. Built for and tested on a MOZA AY210 yoke base with FS25 1.24 on Windows 11.
 
 **To just use it**, run the installer from the [latest release](https://github.com/dbryant4/moza-farmsim-link/releases/latest) and follow [docs/INSTALL.md](docs/INSTALL.md). It keeps itself up to date from there: when a newer release is published here, the icon by the clock offers to install it.
 
@@ -129,6 +129,34 @@ same files, and the mod on its own (`FS25_MozaYokeLink.zip`) for other players i
 game. The installer carries the mod and puts it in the game's mods folder. The program finds new versions through GitHub's "latest release" of this repository
 and installs the file there whose name ends in `-setup.exe`, so every release needs one attached.
 
+### Releases and pre-releases
+
+A release is a tag with the three files from `dist/` attached. There are two kinds:
+
+- **A finished version**, `vX.Y.Z`. Offered to every install.
+- **A pre-release**, `vX.Y.Z-preN`: the Nth try at what will become `vX.Y.Z`. Offered only to
+  installs with *Include pre-releases* switched on. In order, `0.1.3-pre1` comes before
+  `0.1.3-pre2`, which comes before `0.1.3`.
+
+The version is set in two lines at the top of `bridge/CMakeLists.txt`: the number in `project(...)`
+and `set(BRIDGE_PRERELEASE N)`. For a finished version, leave the number out of the second line.
+The mod keeps the plain number (`X.Y.Z.0`), which is all Farming Simulator's version field allows.
+
+So a round of changes goes: set the next number and `BRIDGE_PRERELEASE 1`, publish `vX.Y.Z-pre1`;
+for each further try raise it to 2, 3 and so on; when it has proved itself, clear
+`BRIDGE_PRERELEASE` and publish `vX.Y.Z`. Mark each pre-release as one on GitHub as well
+(`gh release create --prerelease`, or `gh release edit vX.Y.Z-preN --prerelease`), so that GitHub
+does not show it as the latest release.
+
+Two things keep a pre-release away from normal installs even if that mark is missing: the program
+treats any `-preN` version as a pre-release whatever GitHub says, and it leaves every release alone
+for its first 15 minutes (`kReleaseSettleSeconds`), while its files are still being attached.
+Version 0.1.2, which knows nothing of pre-releases, does not recognise a `-preN` tag as a version
+at all.
+
+`moza_fs_bridge.exe --check-update --prereleases` shows what an install with pre-releases on would
+be offered.
+
 The mod is packaged by `fs-mod/package.sh` and installed by copying the zip into FS25's mods folder:
 
 ```bash
@@ -209,6 +237,18 @@ spring scale 34%, damper scale 20%, torque limit 100%).
   `devsdk.log` next to the exe.
 - `Main_Steer_TorqueOutX/Y` come back as N*m decimals, not the raw integer the headers suggest.
 - The base lists its HID interface with 0 axes; it still reports X and Y once opened.
+- **The SDK can lock itself up for good.** On 2026-10-11, nine minutes into a drive with 0.1.2, the
+  link stopped sending forces while its process stayed alive. A memory snapshot showed three
+  threads queued on one read/write lock inside `MOZA_SDK.dll` 1.0.0.4: one of the SDK's own
+  threads holding it for reading and asking for it again further down its own call chain, a
+  second SDK thread waiting to write, and this program's loop waiting to read in
+  `RawParameter::getValue()`. A read/write lock that has a writer waiting lets no further reader
+  in, so none of the three could ever move. None of this program's code was in the SDK threads'
+  call chains. *Lights follow the engine* was on, which opens a second device (the handle) and so
+  gives the SDK a second stream of messages to race on; it had never happened with the base alone,
+  but that link is a suspicion, not a finding. Since nothing can free a thread stuck like that, the
+  link loop is watched (`stall_guard.hpp`): after 10 s without a pass the process ends itself and,
+  in the tray program, starts a fresh copy, at most three times in a row.
 
 ## Still to find out
 

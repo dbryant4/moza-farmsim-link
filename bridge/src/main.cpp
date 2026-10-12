@@ -3,6 +3,7 @@
 
 #include "ffb_session.hpp"
 #include "link.hpp"
+#include "stall_guard.hpp"
 #include "stroke.hpp"
 #include "telemetry.hpp"
 
@@ -23,6 +24,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -30,6 +32,7 @@
 #endif
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <shellapi.h>
 #include <tlhelp32.h>
 #endif
 
@@ -76,6 +79,50 @@ void problem(const char* format, ...)
 /** Where releases are published: "owner/name" on GitHub. */
 [[maybe_unused]] constexpr const char* kRepository = "dbryant4/moza-farmsim-link";
 
+// The link loop calls into the MOZA SDK on every pass, and the SDK has been seen to lock itself up
+// for good (two of its own threads waiting on each other, 2026-10-11). Nothing can free a thread
+// stuck like that, so the loop is watched, and a stuck process is ended and started afresh.
+
+/** Longest the loop may go without a pass. Its slowest honest step, finding the yoke handle, takes about a second. */
+constexpr auto kStallLimit = std::chrono::seconds(10);
+/** A run shorter than this that ends stuck counts toward giving up. */
+[[maybe_unused]] constexpr auto kSettledRun = std::chrono::minutes(10);
+[[maybe_unused]] constexpr int  kMostRestarts = 3;
+
+Clock::time_point g_linkStarted{};
+/** How many times in a row the link has restarted itself after getting stuck; 0 when a person started it. */
+[[maybe_unused]] int g_restarts = 0;
+
+[[noreturn]] void endStuckProcess(int code)
+{
+    std::fflush(nullptr);
+#ifdef _WIN32
+    // Not exit(): that would wait for the very threads that are stuck.
+    TerminateProcess(GetCurrentProcess(), static_cast<UINT>(code));
+#endif
+    std::_Exit(code);
+}
+
+#ifdef BRIDGE_TRAY
+void restartAfterStall();
+#endif
+
+void onLinkStalled(std::chrono::milliseconds silent)
+{
+    std::fprintf(stderr,
+                 "The link has not moved for %.0f s: it is stuck inside the MOZA SDK, which cannot be undone from within. "
+                 "The base lets go of its forces by itself. Ending this process.\n",
+                 static_cast<double>(silent.count()) / 1000.0);
+#ifdef BRIDGE_TRAY
+    // Not when the user had already asked it to stop: then ending is all that was wanted.
+    if (!g_stop)
+    {
+        restartAfterStall();
+    }
+#endif
+    endStuckProcess(71);
+}
+
 #ifdef BRIDGE_TRAY
 bridge::Tray* g_tray = nullptr;
 /** Held by the helper threads while they use g_tray, and by main while it takes the icon away. */
@@ -94,6 +141,8 @@ void withTray(Use use)
 bridge::Updater*  g_updater = nullptr;
 /** Follows the "look for new versions" setting once the link has loaded its settings. */
 std::atomic<bool> g_checkUpdates{true};
+/** Follows the "include pre-releases" setting the same way. */
+std::atomic<bool> g_prereleases{false};
 std::atomic<bool> g_updateInstallable{false};
 std::mutex        g_updateMutex;
 /** The newer release that was found, if any; guarded by g_updateMutex. */
@@ -172,6 +221,13 @@ struct Options
     /** Ask GitHub about the latest release and exit; with fetchUpdate, also download and verify its installer. */
     bool        checkUpdate   = false;
     bool        fetchUpdate   = false;
+    /** For the two above: count releases marked pre-release as well. */
+    bool        prereleases   = false;
+    /** Set by the program when it starts itself again after getting stuck: which restart in a row this is, and the process to wait for. */
+    int         restarted     = 0;
+    unsigned long afterPid    = 0;
+    /** Test option: freeze the link loop this many seconds in, as a call into the SDK that never returns would. 0 is off. */
+    double      testStallAfter = 0.0;
     /** Axis whose spring center is swept back and forth, or -1 for a fixed center. */
     int         sweepAxis             = -1;
     double      sweepAmplitudePercent = 20.0;
@@ -209,6 +265,8 @@ void printUsage()
         "  --list             Print devices and force feedback settings, then exit (no forces)\n"
         "  --check-update     Ask GitHub for the latest release and print it, then exit (no yoke needed)\n"
         "  --fetch-update     The same, and also download and verify its installer without running it\n"
+        "  --prereleases      With either of those: count releases marked pre-release as well\n"
+        "  --test-stall-after S  In link mode: freeze the loop S seconds in, to try the guard that ends a stuck link\n"
         "  --hold             Hold a fixed spring + damper (see --axis, --spring, --damper)\n"
         "  --device TEXT      Use the flight base whose name contains TEXT (default: first found)\n"
         "  --axis AXIS        roll, pitch or both (default: roll)\n"
@@ -360,6 +418,10 @@ Options parseOptions(int argc, char** argv)
         else if (arg == "--quit") options.quit = true;
         else if (arg == "--check-update") options.checkUpdate = true;
         else if (arg == "--fetch-update") options.checkUpdate = options.fetchUpdate = true;
+        else if (arg == "--prereleases") options.prereleases = true;
+        else if (arg == "--test-stall-after") options.testStallAfter = parseNumber("--test-stall-after", next(), 0, 86400);
+        else if (arg == "--restarted") options.restarted = static_cast<int>(parseNumber("--restarted", next(), 0, 1000));
+        else if (arg == "--after-pid") options.afterPid = static_cast<unsigned long>(parseNumber("--after-pid", next(), 0, 4294967295.0));
         else usageError("Unknown option: " + arg);
     }
 
@@ -803,11 +865,22 @@ int run(const Options& options)
 #ifdef BRIDGE_TRAY
         if (g_updater != nullptr)
         {
-            link.checkForUpdates = &g_checkUpdates;
+            link.onUpdateSettings = [](bool check, bool prereleases) {
+                static bool told = false;
+                g_checkUpdates   = check;
+                g_prereleases    = prereleases;
+                // The first telling is the settings as loaded; after that, the user has just changed
+                // one, and should not have to wait a day to see what it does.
+                if (told)
+                {
+                    g_updater->recheck();
+                }
+                told = true;
+            };
             link.versionText     = [] {
                 std::scoped_lock lock(g_updateMutex);
                 return g_newerVersion.empty() ? std::string(BRIDGE_VERSION)
-                                              : BRIDGE_VERSION " (version " + g_newerVersion + " is out: right-click the icon by the clock)";
+                                              : BRIDGE_VERSION " (" + g_newerVersion + " is out: right-click the icon by the clock)";
             };
         }
         if (g_tray != nullptr)
@@ -822,15 +895,39 @@ int run(const Options& options)
                 {
                     g_tray->setSettingsUrl("http://127.0.0.1:" + std::to_string(port) + "/");
                 }
-                g_tray->notify("MOZA FS25 link is running", port > 0 ? "Click this icon to open the settings."
-                                                                    : "The settings page could not start; see the log.");
+                if (g_restarts > 0)
+                {
+                    g_tray->notify("MOZA FS25 link restarted itself", "MOZA's SDK had stopped answering. Forces are back; the log has the details.");
+                }
+                else
+                {
+                    g_tray->notify("MOZA FS25 link is running", port > 0 ? "Click this icon to open the settings."
+                                                                        : "The settings page could not start; see the log.");
+                }
             };
             link.onStatus = [](const std::string& text) { g_tray->setStatus("MOZA FS25 link: " + text); };
         }
 #endif
 
+        bridge::StallGuard guard(kStallLimit, &onLinkStalled);
+        g_linkStarted = Clock::now();
+        const double freezeAfter = options.testStallAfter;
+        link.onLoop              = [&guard, freezeAfter] {
+            if (freezeAfter > 0.0 && Clock::now() - g_linkStarted > std::chrono::duration<double>(freezeAfter))
+            {
+                std::puts("--test-stall-after: the loop stops here and never comes back.");
+                for (;;)
+                {
+                    std::this_thread::sleep_for(std::chrono::hours(1));
+                }
+            }
+            guard.beat();
+        };
+
         const int result = bridge::runLink(base, hid, link, g_stop);
 
+        // From here the exit watchdog below is what bounds a teardown that does not finish.
+        guard.disarm();
         armExitWatchdog();
         shutdownStep("closing the HID interface");
         if (hid)
@@ -1102,13 +1199,19 @@ std::wstring widen(const std::string& text)
     return wide;
 }
 
-/** With no console, everything printed goes to a log file beside the program, started afresh each run. */
-std::filesystem::path redirectOutputToLog()
+/**
+ * With no console, everything printed goes to a log file beside the program, started afresh each
+ * run; except with @p keep, after the program restarted itself, when what led up to that stays.
+ */
+std::filesystem::path redirectOutputToLog(bool keep)
 {
     const std::filesystem::path path = executableDirectory() / "moza_fs_bridge.log";
-    if (FILE* fresh = _wfopen(path.c_str(), L"w"))
+    if (!keep)
     {
-        std::fclose(fresh);
+        if (FILE* fresh = _wfopen(path.c_str(), L"w"))
+        {
+            std::fclose(fresh);
+        }
     }
     // Both in append mode on the one file, so neither stream writes over the other.
     _wfreopen(path.c_str(), L"a", stdout);
@@ -1119,21 +1222,130 @@ std::filesystem::path redirectOutputToLog()
 #endif
 
 #ifdef BRIDGE_TRAY
+namespace {
+
+/** What this program was started with, less what it adds when restarting itself. */
+std::vector<std::wstring> g_ownArguments;
+
+void rememberOwnArguments()
+{
+    int             count = 0;
+    wchar_t** const all   = CommandLineToArgvW(GetCommandLineW(), &count);
+    if (all == nullptr)
+    {
+        return;
+    }
+    for (int i = 1; i < count; ++i)
+    {
+        const std::wstring argument = all[i];
+        if (argument == L"--restarted" || argument == L"--after-pid")
+        {
+            ++i;
+            continue;
+        }
+        g_ownArguments.push_back(argument);
+    }
+    LocalFree(all);
+}
+
+/** @p argument as it has to be written on a command line to arrive unchanged. */
+std::wstring quoted(const std::wstring& argument)
+{
+    if (!argument.empty() && argument.find_first_of(L" \t\"") == std::wstring::npos)
+    {
+        return argument;
+    }
+    std::wstring out = L"\"";
+    std::size_t  backslashes = 0;
+    for (const wchar_t c : argument)
+    {
+        if (c == L'\\')
+        {
+            ++backslashes;
+            continue;
+        }
+        // Backslashes only need doubling where a quote follows them.
+        out.append(c == L'"' ? backslashes * 2 + 1 : backslashes, L'\\');
+        backslashes = 0;
+        out += c;
+    }
+    out.append(backslashes * 2, L'\\');
+    out += L'"';
+    return out;
+}
+
+/** Starts this program again, to take over once this stuck copy has ended. Gives up after a few quick repeats. */
+void restartAfterStall()
+{
+    const int next = Clock::now() - g_linkStarted < kSettledRun ? g_restarts + 1 : 1;
+    if (next > kMostRestarts)
+    {
+        std::fprintf(stderr, "That is %d times in quick succession, so it is not being started again.\n", next);
+        std::fflush(nullptr);
+        MessageBoxW(nullptr,
+                    L"The link keeps getting stuck inside MOZA's SDK, so it has stopped.\n\nRestarting MOZA Cockpit usually clears this. "
+                    L"If \"Lights follow the engine\" is switched on, try with it off.",
+                    kWindowTitle, MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
+        return;
+    }
+
+    wchar_t     self[1024];
+    const DWORD length = GetModuleFileNameW(nullptr, self, ARRAYSIZE(self));
+    if (length == 0 || length >= ARRAYSIZE(self))
+    {
+        std::fprintf(stderr, "It could not be started again: its own path is not known.\n");
+        return;
+    }
+    std::wstring command = quoted(self);
+    for (const std::wstring& argument : g_ownArguments)
+    {
+        command += L" " + quoted(argument);
+    }
+    command += L" --restarted " + std::to_wstring(next) + L" --after-pid " + std::to_wstring(GetCurrentProcessId());
+
+    STARTUPINFOW        startup{};
+    PROCESS_INFORMATION process{};
+    startup.cb = sizeof(startup);
+    if (!CreateProcessW(self, command.data(), nullptr, nullptr, FALSE, 0, nullptr, executableDirectory().c_str(), &startup, &process))
+    {
+        std::fprintf(stderr, "It could not be started again (error %lu).\n", GetLastError());
+        return;
+    }
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    std::fprintf(stderr, "Started it again (restart %d of at most %d in a row).\n", next, kMostRestarts);
+}
+
+} // namespace
+
 /** A newer release was found: into the menu, onto the settings page, and a bubble to say so. */
 void offerUpdate(const bridge::ReleaseInfo& release, bool installable)
 {
     const std::string version = release.version.text();
+    // A "-preN" version says what it is; one that is only marked on GitHub needs it said.
+    const std::string name    = (release.prerelease && release.version.pre == 0 ? "pre-release " : "version ") + version;
     {
         std::scoped_lock lock(g_updateMutex);
-        g_newerVersion = version;
+        g_newerVersion = name;
     }
     g_updateInstallable = installable;
     withTray([&](bridge::Tray& tray) {
-        tray.setUpdate(version, installable);
-        tray.notify("Version " + version + " is available",
-                    installable ? "Right-click this icon and pick \"Install version " + version + "\" when you are not driving."
+        tray.setUpdate(name, installable);
+        tray.notify((release.prerelease ? "Pre-release " : "Version ") + version + " is available",
+                    installable ? "Right-click this icon and pick \"Install " + name + "\" when you are not driving."
                                 : "Right-click this icon for the download page.");
     });
+}
+
+/** What was on offer no longer is: pre-releases were switched off, or the checks were. */
+void withdrawUpdate()
+{
+    {
+        std::scoped_lock lock(g_updateMutex);
+        g_newerVersion.clear();
+    }
+    g_updateInstallable = false;
+    withTray([](bridge::Tray& tray) { tray.setUpdate({}, false); });
 }
 
 /**
@@ -1234,8 +1446,29 @@ int main(int argc, char** argv)
                     kWindowTitle, MB_OK | MB_ICONINFORMATION);
         return 64;
     }
+    rememberOwnArguments();
+    g_restarts = options.restarted;
+    if (options.afterPid != 0)
+    {
+        // Started by a copy of this program that had got stuck and is ending itself: let it go first.
+        if (const HANDLE old = OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(options.afterPid)))
+        {
+            WaitForSingleObject(old, 15000);
+            CloseHandle(old);
+        }
+    }
     // One at a time: a second copy would fight the first over the yoke. Starting it again just opens the settings.
-    CreateMutexW(nullptr, FALSE, L"Local\\MozaFsLinkInstance");
+    HANDLE instance = CreateMutexW(nullptr, FALSE, L"Local\\MozaFsLinkInstance");
+    for (int attempt = 0; GetLastError() == ERROR_ALREADY_EXISTS && options.restarted > 0 && attempt < 20; ++attempt)
+    {
+        // The stuck copy is still on its way out.
+        if (instance != nullptr)
+        {
+            CloseHandle(instance);
+        }
+        Sleep(250);
+        instance = CreateMutexW(nullptr, FALSE, L"Local\\MozaFsLinkInstance");
+    }
     if (GetLastError() == ERROR_ALREADY_EXISTS)
     {
         bridge::Tray::openInBrowser("http://127.0.0.1:" + std::to_string(options.uiPort) + "/");
@@ -1247,8 +1480,12 @@ int main(int argc, char** argv)
         options.waitSeconds = 60.0;
     }
     // Only now, as the one running instance: a second start or --quit must not wipe the first one's log.
-    const std::filesystem::path logPath = redirectOutputToLog();
+    const std::filesystem::path logPath = redirectOutputToLog(options.restarted > 0);
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    if (options.restarted > 0)
+    {
+        std::printf("\n---- started again by itself after getting stuck (restart %d in a row) ----\n", options.restarted);
+    }
 
     // Made before the icon and ended after it, so that the menu's entries always have something to call.
     std::unique_ptr<bridge::Updater> updater;
@@ -1258,8 +1495,10 @@ int main(int argc, char** argv)
         updates.repository       = kRepository;
         updates.current          = *current;
         updates.installDirectory = executableDirectory();
-        updates.enabled          = [] { return g_checkUpdates.load(); };
-        updates.onAvailable      = &offerUpdate;
+        updates.enabled            = [] { return g_checkUpdates.load(); };
+        updates.includePrereleases = [] { return g_prereleases.load(); };
+        updates.onAvailable        = &offerUpdate;
+        updates.onWithdrawn        = &withdrawUpdate;
         updates.onMessage        = [](const std::string& title, const std::string& text) {
             withTray([&](bridge::Tray& tray) { tray.notify(title, text); });
         };
@@ -1295,7 +1534,8 @@ int main(int argc, char** argv)
     {
 #ifdef _WIN32
         // Nothing here touches the yoke or the MOZA SDK.
-        return bridge::printUpdateCheck(kRepository, bridge::parseVersion(BRIDGE_VERSION).value_or(bridge::Version{}), options.fetchUpdate);
+        return bridge::printUpdateCheck(kRepository, bridge::parseVersion(BRIDGE_VERSION).value_or(bridge::Version{}), options.fetchUpdate,
+                                        options.prereleases);
 #else
         std::puts("Updates are only looked for on Windows.");
         return 64;

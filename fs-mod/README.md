@@ -48,8 +48,8 @@ In `Documents\My Games\FarmingSimulator2025\log.txt`, search for `[MozaYokeLink]
 start looks like this, in this order:
 
 ```
-[MozaYokeLink] version 0.1.2.0 script loaded
-[MozaYokeLink] version 0.1.2.0, telemetry file: C:/Users/.../modSettings/FS25_MozaYokeLink/telemetry.txt
+[MozaYokeLink] version 0.1.3.0 script loaded
+[MozaYokeLink] version 0.1.3.0, telemetry file: C:/Users/.../modSettings/FS25_MozaYokeLink/telemetry.txt
 [MozaYokeLink] first write ok (io): MOZAFS 1 seq=1 t=0 active=0 end=1
 [MozaYokeLink] force feedback override installed on InputBinding class; the game keeps its steering force feedback until the bridge shows up in C:/Users/.../modSettings/FS25_MozaYokeLink/bridge.xml (checked with XMLFile.loadIfExists)
 ```

@@ -24,8 +24,12 @@ public:
         std::filesystem::path installDirectory;
         /** Asked before each check the updater makes by itself; one asked for by hand always runs. */
         std::function<bool()> enabled;
+        /** Asked at each check: whether releases marked pre-release on GitHub are offered too. */
+        std::function<bool()> includePrereleases;
         /** A newer release exists. Called from the updater's thread, once per release found. */
         std::function<void(const ReleaseInfo& release, bool installable)> onAvailable;
+        /** A release offered earlier no longer applies, typically because pre-releases were switched off. */
+        std::function<void()> onWithdrawn;
         /** Something the user should be told: the answer to a check made by hand, progress, or a failure. */
         std::function<void(const std::string& title, const std::string& text)> onMessage;
     };
@@ -44,6 +48,8 @@ public:
 
     /** Checks now, and says so through onMessage even when there is nothing new. Returns at once. */
     void checkNow();
+    /** Checks now without a word unless there is something new: for when what `enabled` or `includePrereleases` answer has changed. */
+    void recheck();
     /**
      * Downloads the newer release's installer and runs it. The installer asks this program to
      * close, replaces it and starts it again. Returns at once; does nothing if no installable
@@ -68,6 +74,6 @@ private:
  * For --check-update: asks GitHub once and prints what it found. With @p fetch the installer is
  * also downloaded and verified, then deleted; it is never run. Returns a process exit code.
  */
-int printUpdateCheck(const std::string& repository, const Version& current, bool fetch);
+int printUpdateCheck(const std::string& repository, const Version& current, bool fetch, bool includePrereleases);
 
 } // namespace bridge

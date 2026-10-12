@@ -144,8 +144,8 @@ struct Tray::Impl
             if (!newer.empty() && config.installUpdate)
             {
                 // The entry says what picking it does, so that nothing further needs asking.
-                const std::wstring offer = installable ? L"Install version " + newer + L" (the link restarts)"
-                                                       : L"Download version " + newer + L" (opens GitHub)";
+                const std::wstring offer = installable ? L"Install " + newer + L" (the link restarts)"
+                                                       : L"Download " + newer + L" (opens GitHub)";
                 AppendMenuW(menu, MF_STRING, kInstallUpdate, offer.c_str());
                 if (installable && config.showUpdateNotes)
                 {
@@ -356,10 +356,10 @@ void Tray::setSettingsUrl(const std::string& url)
     m_impl->settingsUrl = widen(url);
 }
 
-void Tray::setUpdate(const std::string& version, bool installable)
+void Tray::setUpdate(const std::string& name, bool installable)
 {
     std::scoped_lock lock(m_impl->mutex);
-    m_impl->updateVersion     = widen(version);
+    m_impl->updateVersion     = widen(name);
     m_impl->updateInstallable = installable;
 }
 

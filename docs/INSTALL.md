@@ -46,6 +46,10 @@ downloaded or installed until you pick it, so it never happens under you while d
 
 - **Check for updates** in the same menu asks straight away.
 - *Look for new versions* on the settings page turns the daily check off.
+- *Include pre-releases* (off by default) also offers pre-releases: tries at the next version,
+  newer and less tested, numbered like `0.1.3-pre1`. Turning it off again does not go back to an
+  older version; you stay on what you have until a newer finished version is out.
+- A release is left alone for its first quarter of an hour, while its files are still being put up.
 - The mod is updated along with the program. If Farming Simulator is running at the time, the
   game has the mod's file open; the program replaces it once the game has closed.
 - In multiplayer everyone needs the same mod file, so update together.
@@ -103,6 +107,10 @@ it is a motor, and the test options move it on their own.
   savegame, and look for lines starting `[MozaYokeLink]` in
   `Documents\My Games\FarmingSimulator2025\log.txt`.
 - **Forces disappear mid-drive:** switch *Forces* off and on again on the settings page.
+- **"MOZA FS25 link restarted itself":** MOZA's SDK had stopped answering, which it has been seen to
+  do, and the only cure is a fresh start, so the link gives itself one; forces are back within
+  about fifteen seconds. If it happens often, try with *Lights follow the engine* off, and restart
+  MOZA Cockpit. After three in quick succession it stops and says so.
 
 ## What it changes on your PC
 

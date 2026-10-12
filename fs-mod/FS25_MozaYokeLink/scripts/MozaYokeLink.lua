@@ -31,7 +31,7 @@ MozaYokeLink = {}
 MozaYokeLink.suppressGameForceFeedback = true
 
 -- Keep in step with <version> in modDesc.xml (the tests check this).
-MozaYokeLink.VERSION = "0.1.2.0"
+MozaYokeLink.VERSION = "0.1.3.0"
 
 -- Fixed by the telemetry contract; deliberately not derived from the mod's
 -- file name.

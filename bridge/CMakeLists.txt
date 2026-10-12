@@ -1,5 +1,14 @@
 cmake_minimum_required(VERSION 3.21)
-project(moza_fs_bridge VERSION 0.1.2 LANGUAGES CXX)
+project(moza_fs_bridge VERSION 0.1.3 LANGUAGES CXX)
+
+# Which pre-release of that version this is: 1 builds 0.1.3-pre1, published as tag v0.1.3-pre1.
+# For the finished version leave the number out: set(BRIDGE_PRERELEASE ). scripts/package-release.sh reads this line.
+set(BRIDGE_PRERELEASE 1)
+if(BRIDGE_PRERELEASE)
+    set(BRIDGE_VERSION_TEXT "${PROJECT_VERSION}-pre${BRIDGE_PRERELEASE}")
+else()
+    set(BRIDGE_VERSION_TEXT "${PROJECT_VERSION}")
+endif()
 
 # The SDK's typed device headers (moza/device_as.hpp) use concepts.
 set(CMAKE_CXX_STANDARD 20)
@@ -63,7 +72,7 @@ else()
 endif()
 
 add_executable(moza_fs_bridge src/main.cpp)
-target_compile_definitions(moza_fs_bridge PRIVATE BRIDGE_VERSION="${PROJECT_VERSION}")
+target_compile_definitions(moza_fs_bridge PRIVATE BRIDGE_VERSION="${BRIDGE_VERSION_TEXT}")
 target_link_libraries(moza_fs_bridge PRIVATE bridge_core)
 if(MINGW)
     # Fold the GCC runtime into the exe so MOZA_SDK.dll is the only file that has to ship with it.
@@ -78,7 +87,7 @@ if(WIN32)
     target_sources(moza_fs_bridge PRIVATE src/updater_win.cpp windows/app.rc)
     target_link_libraries(moza_fs_bridge PRIVATE winhttp bcrypt shell32)
     add_executable(moza_fs_link WIN32 src/main.cpp src/tray_win.cpp src/updater_win.cpp windows/app.rc)
-    target_compile_definitions(moza_fs_link PRIVATE BRIDGE_TRAY BRIDGE_VERSION="${PROJECT_VERSION}")
+    target_compile_definitions(moza_fs_link PRIVATE BRIDGE_TRAY BRIDGE_VERSION="${BRIDGE_VERSION_TEXT}")
     target_link_libraries(moza_fs_link PRIVATE bridge_core shell32 winhttp bcrypt)
     if(MINGW)
         target_link_options(moza_fs_link PRIVATE -static $<$<CONFIG:Release>:-s>)
@@ -109,6 +118,9 @@ if(BRIDGE_FAKE_SDK)
     add_test(NAME bridge_link COMMAND moza_fs_bridge --seconds 1.5 --ui-port 18778
              --telemetry "${CMAKE_CURRENT_BINARY_DIR}/no-telemetry.txt" --settings "${CMAKE_CURRENT_BINARY_DIR}/link-test.ini")
     add_test(NAME bridge_list COMMAND moza_fs_bridge --list)
+    # A loop that freezes, as inside an SDK call that never returns: the guard ends the process with its own exit code.
+    add_test(NAME bridge_stall COMMAND sh -c "\"$<TARGET_FILE:moza_fs_bridge>\" --no-ui --seconds 60 --test-stall-after 0.5 --telemetry \"${CMAKE_CURRENT_BINARY_DIR}/no-telemetry.txt\" --settings \"${CMAKE_CURRENT_BINARY_DIR}/stall-test.ini\"; test $? -eq 71")
+    set_tests_properties(bridge_stall PROPERTIES TIMEOUT 30)
     add_test(NAME bridge_sweep COMMAND moza_fs_bridge --sweep pitch --sweep-period 1 --seconds 1.2)
     add_test(NAME bridge_force COMMAND moza_fs_bridge --force pitch --force-period 1 --seconds 1.2)
     # The fake's axis never moves, so this exercises the stall path: each end is given up on in turn.
@@ -121,6 +133,10 @@ if(BRIDGE_FAKE_SDK)
     add_executable(test_update tests/test_update.cpp)
     target_link_libraries(test_update PRIVATE bridge_core)
     add_test(NAME update COMMAND test_update)
+    # The guard that notices a loop stuck inside the SDK.
+    add_executable(test_stall_guard tests/test_stall_guard.cpp)
+    target_link_libraries(test_stall_guard PRIVATE bridge_core)
+    add_test(NAME stall_guard COMMAND test_stall_guard)
     # Not a test: serves the tuning page with simulated values, for looking at it in a browser.
     add_executable(web_ui_demo tests/web_ui_demo.cpp)
     target_link_libraries(web_ui_demo PRIVATE bridge_core)

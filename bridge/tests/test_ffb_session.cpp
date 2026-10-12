@@ -9,6 +9,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <iterator>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -642,6 +643,111 @@ void testYokeLightColourRunsFromTheUsersOwnThroughAmberToRed()
     CHECK(bridge::YokeLights::colorAt(blue, std::nan("")) == blue);
 }
 
+void testYokeLightsAreRememberedAcrossARunThatEndsBadly()
+{
+    namespace fs = std::filesystem;
+    using Clock  = bridge::YokeLights::Clock;
+    constexpr int kBrightnessParameter = 4011;
+    constexpr int kColorParameter      = 4012;
+    const auto    rgb                  = [](long long r, long long g, long long b) { return std::vector<long long>{r, g, b}; };
+    const auto    slurp                = [](const fs::path& path) {
+        std::ifstream file(path);
+        return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    };
+
+    const fs::path folder = fs::temp_directory_path() / "moza_fs_bridge_test_lights";
+    fs::remove_all(folder);
+    fs::create_directories(folder);
+    const fs::path memo = folder / "yoke_lights_original.txt";
+
+    Fixture fixture;
+    fake_moza::state().handlePresent                    = true;
+    fake_moza::state().parameters[kBrightnessParameter] = 15;
+    fake_moza::state().listParameters[kColorParameter]  = rgb(0, 255, 0);
+    Clock::time_point when  = Clock::now();
+    const auto        later = [&when] { return when += std::chrono::seconds(1); };
+
+    std::string remembered;
+    {
+        bridge::YokeLights lights(memo);
+        CHECK(!lights.restorePending());
+        CHECK(lights.attach());
+        // Looking changes nothing, so there is nothing to remember yet.
+        CHECK(!fs::exists(memo));
+        lights.show(12.0, 0.0, later());
+        // Before the first change went out, what was there has been written down.
+        CHECK(fs::exists(memo));
+        remembered = slurp(memo);
+        CHECK(remembered == "brightness=15 color=0,255,0\n");
+        lights.show(12.0, 0.25, later());
+        CHECK(fake_moza::state().parameters[kBrightnessParameter] == 12);
+        CHECK(fake_moza::state().listParameters[kColorParameter] == rgb(128, 203, 0));
+        CHECK(slurp(memo) == remembered);
+    }
+    // An orderly end puts the lights back and has no more use for the memo.
+    CHECK(fake_moza::state().parameters[kBrightnessParameter] == 15);
+    CHECK(fake_moza::state().listParameters[kColorParameter] == rgb(0, 255, 0));
+    CHECK(!fs::exists(memo));
+
+    // The same run ending badly instead: the handle keeps the changed values, and the memo stays.
+    fake_moza::state().parameters[kBrightnessParameter] = 12;
+    fake_moza::state().listParameters[kColorParameter]  = rgb(128, 203, 0);
+    std::ofstream(memo) << remembered;
+    {
+        bridge::YokeLights next(memo);
+        // Reason enough to attach, whether or not the lights are meant to follow the engine this time.
+        CHECK(next.restorePending());
+        CHECK(next.attach());
+        CHECK(!next.restorePending());
+        CHECK(next.original() == 15 && next.current() == 12);
+        CHECK(next.color() == (bridge::Rgb{128, 203, 0}));
+        // "As they were found" now means as the user had them, brightness first and then the colour.
+        next.show(-1.0, 0.0, later());
+        CHECK(fake_moza::state().parameters[kBrightnessParameter] == 15);
+        next.show(-1.0, 0.0, later());
+        CHECK(fake_moza::state().listParameters[kColorParameter] == rgb(0, 255, 0));
+        CHECK(fs::exists(memo));
+    }
+    CHECK(!fs::exists(memo));
+    CHECK(fake_moza::state().parameters[kBrightnessParameter] == 15);
+    CHECK(fake_moza::state().listParameters[kColorParameter] == rgb(0, 255, 0));
+
+    // Never attached again before the program ends: the memo waits for the next run.
+    fake_moza::state().parameters[kBrightnessParameter] = 12;
+    std::ofstream(memo) << remembered;
+    {
+        bridge::YokeLights idle(memo);
+        CHECK(idle.restorePending());
+    }
+    CHECK(fs::exists(memo));
+    {
+        bridge::YokeLights next(memo);
+        CHECK(next.attach() && next.original() == 15);
+    }
+    CHECK(fake_moza::state().parameters[kBrightnessParameter] == 15 && !fs::exists(memo));
+
+    // A memo that makes no sense is not believed: the handle's present values count as its own.
+    for (const char* nonsense : {"", "brightness=99 color=0,255,0\n", "brightness=-1\n", "hello\n"})
+    {
+        fake_moza::state().parameters[kBrightnessParameter] = 7;
+        std::ofstream(memo) << nonsense;
+        bridge::YokeLights wary(memo);
+        CHECK(wary.attach() && wary.original() == 7);
+    }
+    // One without a colour still restores the brightness and leaves the colour as the handle has it.
+    fake_moza::state().parameters[kBrightnessParameter] = 4;
+    fake_moza::state().listParameters[kColorParameter]  = rgb(10, 20, 30);
+    std::ofstream(memo) << "brightness=9\n";
+    {
+        bridge::YokeLights partial(memo);
+        CHECK(partial.attach() && partial.original() == 9);
+    }
+    CHECK(fake_moza::state().parameters[kBrightnessParameter] == 9);
+    CHECK(fake_moza::state().listParameters[kColorParameter] == rgb(10, 20, 30));
+
+    fs::remove_all(folder);
+}
+
 void testYokeLightsChangeAndRestoreTheHandlesSettings()
 {
     using Clock = bridge::YokeLights::Clock;
@@ -795,6 +901,7 @@ int main()
     testLightsFollowEachMachinesOwnEngineRange();
     testYokeLightColourRunsFromTheUsersOwnThroughAmberToRed();
     testYokeLightsChangeAndRestoreTheHandlesSettings();
+    testYokeLightsAreRememberedAcrossARunThatEndsBadly();
     testPresenceFileBeatsWhileAliveAndIsRemovedAfterwards();
     testPresenceFileStaysQuietWithoutTheModsFolder();
     testDeviceForcesScaleAndRoute();

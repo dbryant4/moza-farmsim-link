@@ -1,5 +1,6 @@
 ; Installer for MOZA FS25 Link. Built by scripts/package-release.sh:
-;   makensis -DVERSION=0.1.2 -DSOURCE=<folder with the files> -DOUTFILE=<setup.exe> installer/moza-farmsim-link.nsi
+;   makensis -DVERSION=0.1.3-pre1 -DNUMVERSION=0.1.3 -DSOURCE=<folder with the files> -DOUTFILE=<setup.exe> installer/moza-farmsim-link.nsi
+; VERSION is what people see; NUMVERSION is the same without any "-preN", for where Windows wants numbers only.
 ;
 ; Installs per user (no administrator prompt), so the program can update itself later.
 ; MOZA_SDK.dll is MOZA's to distribute and is not inside this installer: on a first install the
@@ -33,7 +34,7 @@ OutFile "${OUTFILE}"
 RequestExecutionLevel user
 InstallDir "$LOCALAPPDATA\Programs\${APP_NAME}"
 InstallDirRegKey HKCU "${SETTINGS_KEY}" "InstallDir"
-VIProductVersion "${VERSION}.0"
+VIProductVersion "${NUMVERSION}.0"
 VIAddVersionKey "ProductName" "${APP_NAME}"
 VIAddVersionKey "FileDescription" "${APP_NAME} setup"
 VIAddVersionKey "FileVersion" "${VERSION}"
@@ -351,6 +352,7 @@ Section "Uninstall"
   Delete "$INSTDIR\LICENSE.txt"
   Delete "$INSTDIR\moza_fs_bridge.log"
   Delete "$INSTDIR\devsdk.log"
+  Delete "$INSTDIR\yoke_lights_original.txt"
   Delete "$INSTDIR\uninstall.exe"
 
   ${IfNot} ${Silent}

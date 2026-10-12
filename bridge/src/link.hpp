@@ -109,8 +109,16 @@ struct LinkOptions
     std::function<void(int uiPort)>              onStarted;
     std::function<void(const std::string& text)> onStatus;
 
-    /** If set, kept equal to the "check for new versions" setting, from before onStarted is called. */
-    std::atomic<bool>* checkForUpdates = nullptr;
+    /**
+     * If set, told the two update settings (look for new versions at all; include pre-releases):
+     * once before onStarted is called, and again whenever either changes.
+     */
+    std::function<void(bool check, bool prereleases)> onUpdateSettings;
+    /**
+     * If set, called on every pass of the loop and between the steps of its orderly end, for a
+     * guard that wants to know the loop is still going (see stall_guard.hpp).
+     */
+    std::function<void()> onLoop;
     /** If set, shown on the settings page as the program's version and asked for again about once a second. */
     std::function<std::string()> versionText;
 };

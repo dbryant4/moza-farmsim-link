@@ -9,8 +9,10 @@
 #include <shellapi.h>
 #include <winhttp.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <ctime>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -214,15 +216,38 @@ std::string failureText(int status, const std::string& error)
     return status == 0 ? error : "GitHub answered " + std::to_string(status);
 }
 
-/** Asks GitHub for the repository's latest release. Returns the HTTP status (0 if there was none) and fills @p body. */
-int fetchLatest(const std::string& repository, const std::wstring& agent, const std::atomic<bool>& stop, std::string& body, std::string& error)
+/**
+ * Asks GitHub for the newest release of the repository, with or without those marked pre-release.
+ * Returns the HTTP status (0 if there was none); @p release is left empty if there is none to offer.
+ */
+int fetchNewest(const std::string& repository, bool includePrereleases, const std::wstring& agent, const std::atomic<bool>& stop,
+                std::optional<ReleaseInfo>& release, std::string& error)
 {
-    return httpsGet(widen("https://api.github.com/repos/" + repository + "/releases/latest"), agent, stop,
-                    [&](const char* data, std::size_t size) {
-                        body.append(data, size);
-                        return body.size() <= kLargestDocument;
-                    },
-                    error);
+    // "latest" is GitHub's own pick of the newest normal release. It never names a pre-release, so
+    // for those the recent releases are listed and the highest version among them taken.
+    const std::string path = includePrereleases ? "/releases?per_page=10" : "/releases/latest";
+    std::string       body;
+    const int         status = httpsGet(widen("https://api.github.com/repos/" + repository + path), agent, stop,
+                                        [&](const char* data, std::size_t size) {
+                                    body.append(data, size);
+                                    return body.size() <= kLargestDocument;
+                                },
+                                        error);
+    if (status == 200)
+    {
+        release = includePrereleases ? newestRelease(body, true) : parseLatestRelease(body);
+    }
+    return status;
+}
+
+std::int64_t nowSeconds()
+{
+    return static_cast<std::int64_t>(std::time(nullptr));
+}
+
+const char* kindOf(const ReleaseInfo& release)
+{
+    return release.prerelease ? "pre-release" : "version";
 }
 
 /**
@@ -300,6 +325,7 @@ struct Updater::Impl
     HANDLE wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
     std::atomic<bool> wantCheck{false};
+    std::atomic<bool> wantQuietCheck{false};
     std::atomic<bool> wantInstall{false};
 
     std::mutex                 mutex;
@@ -325,14 +351,16 @@ struct Updater::Impl
         return installedCopy() && isReleaseDownload(release.installerUrl, config.repository) && !safeFileName(release.installerName).empty();
     }
 
-    void check(bool byHand)
+    /** Returns how long to wait before looking again, in ms; 0 for the usual interval. */
+    DWORD check(bool byHand)
     {
-        std::string body;
-        std::string error;
-        const int   status = fetchLatest(config.repository, agent, stopping, body, error);
+        const bool                 prereleases = config.includePrereleases && config.includePrereleases();
+        std::optional<ReleaseInfo> release;
+        std::string                error;
+        const int                  status = fetchNewest(config.repository, prereleases, agent, stopping, release, error);
         if (stopping)
         {
-            return;
+            return 0;
         }
         if (status != 200)
         {
@@ -342,18 +370,31 @@ struct Updater::Impl
             {
                 config.onMessage("Could not check for updates", "GitHub could not be reached (" + why + ").");
             }
-            return;
+            return 0;
         }
 
-        const auto release = parseLatestRelease(body);
         if (!release || !(release->version > config.current))
         {
-            std::printf("Update: version %s is the latest.\n", config.current.text().c_str());
+            std::printf("Update: version %s is the latest%s.\n", config.current.text().c_str(), prereleases ? ", pre-releases included" : "");
+            withdraw();
             if (byHand && config.onMessage)
             {
-                config.onMessage("No update", "Version " + config.current.text() + " is the latest.");
+                config.onMessage("No update", "Version " + config.current.text() + " is the latest" + (prereleases ? ", pre-releases included." : "."));
             }
-            return;
+            return 0;
+        }
+
+        // Just published: its files may not all be attached yet, or it may be about to be marked a pre-release.
+        if (const std::int64_t settling = secondsUntilSettled(*release, nowSeconds()); settling > 0)
+        {
+            std::printf("Update: %s %s was published moments ago; looking again in %lld s.\n", kindOf(*release), release->version.text().c_str(),
+                        static_cast<long long>(settling));
+            if (byHand && config.onMessage)
+            {
+                config.onMessage("A new version is on its way", "Version " + release->version.text() +
+                                                                    " was published a few minutes ago and is still being put up. It will be offered shortly.");
+            }
+            return static_cast<DWORD>(settling + 30) * 1000;
         }
 
         bool fresh;
@@ -362,10 +403,26 @@ struct Updater::Impl
             fresh = !newer || newer->version != release->version;
             newer = *release;
         }
-        std::printf("Update: version %s is available (%s).\n", release->version.text().c_str(), release->pageUrl.c_str());
+        std::printf("Update: %s %s is available (%s).\n", kindOf(*release), release->version.text().c_str(), release->pageUrl.c_str());
         if ((fresh || byHand) && config.onAvailable)
         {
             config.onAvailable(*release, installable(*release));
+        }
+        return 0;
+    }
+
+    /** Takes back an offer that no longer stands. */
+    void withdraw()
+    {
+        bool had;
+        {
+            std::scoped_lock lock(mutex);
+            had = newer.has_value();
+            newer.reset();
+        }
+        if (had && config.onWithdrawn)
+        {
+            config.onWithdrawn();
         }
     }
 
@@ -431,10 +488,12 @@ struct Updater::Impl
 
     void run()
     {
-        DWORD wait = kFirstCheckDelayMs;
+        ULONGLONG nextCheck = GetTickCount64() + kFirstCheckDelayMs;
         while (!stopping)
         {
-            const bool timedOut = WaitForSingleObject(wake, wait) == WAIT_TIMEOUT;
+            const ULONGLONG now      = GetTickCount64();
+            const DWORD     wait     = nextCheck > now ? static_cast<DWORD>(std::min<ULONGLONG>(nextCheck - now, kCheckIntervalMs)) : 0;
+            const bool      timedOut = WaitForSingleObject(wake, wait) == WAIT_TIMEOUT;
             if (stopping)
             {
                 break;
@@ -445,13 +504,21 @@ struct Updater::Impl
                 continue;
             }
             const bool byHand = wantCheck.exchange(false);
-            if (byHand || (timedOut && (!config.enabled || config.enabled())))
+            const bool quiet  = wantQuietCheck.exchange(false);
+            const bool wanted = !config.enabled || config.enabled();
+            if (byHand || ((timedOut || quiet) && wanted))
             {
-                check(byHand);
+                const DWORD again = check(byHand);
+                nextCheck         = GetTickCount64() + (again != 0 ? again : kCheckIntervalMs);
             }
-            if (timedOut)
+            else if (timedOut)
             {
-                wait = kCheckIntervalMs;
+                nextCheck = GetTickCount64() + kCheckIntervalMs;
+            }
+            if (!wanted)
+            {
+                // Checks were switched off: what was on offer came from them.
+                withdraw();
             }
         }
     }
@@ -497,6 +564,12 @@ void Updater::checkNow()
     SetEvent(m_impl->wake);
 }
 
+void Updater::recheck()
+{
+    m_impl->wantQuietCheck = true;
+    SetEvent(m_impl->wake);
+}
+
 void Updater::installNow()
 {
     m_impl->wantInstall = true;
@@ -527,7 +600,7 @@ bool Updater::installed() const
     return m_impl->installedCopy();
 }
 
-int printUpdateCheck(const std::string& repository, const Version& current, bool fetch)
+int printUpdateCheck(const std::string& repository, const Version& current, bool fetch, bool includePrereleases)
 {
     // The hashing is Windows' own; one known answer shows it is being driven correctly.
     Sha256 known;
@@ -540,24 +613,28 @@ int printUpdateCheck(const std::string& repository, const Version& current, bool
 
     const std::atomic<bool> stop{false};
     const std::wstring      agent = widen("moza-farmsim-link/" + current.text());
-    std::string             body;
-    std::string             error;
-    const int               status = fetchLatest(repository, agent, stop, body, error);
+    std::optional<ReleaseInfo> release;
+    std::string                error;
+    const int                  status = fetchNewest(repository, includePrereleases, agent, stop, release, error);
     if (status != 200)
     {
         std::printf("GitHub could not be asked about %s (%s).\n", repository.c_str(), failureText(status, error).c_str());
         return 1;
     }
-    const auto release = parseLatestRelease(body);
     if (!release)
     {
         std::puts("GitHub's answer does not describe a published release with a version number.");
         return 1;
     }
     const bool newer = release->version > current;
-    std::printf("This is version %s; the latest release is %s (%s).\n", current.text().c_str(), release->version.text().c_str(),
+    std::printf("This is version %s; the latest release%s is %s %s (%s).\n", current.text().c_str(),
+                includePrereleases ? ", pre-releases included," : "", kindOf(*release), release->version.text().c_str(),
                 newer ? "newer" : "not newer");
     std::printf("  page:      %s\n", release->pageUrl.c_str());
+    if (const std::int64_t settling = secondsUntilSettled(*release, nowSeconds()); settling > 0)
+    {
+        std::printf("  published moments ago: the program leaves it alone for another %lld s\n", static_cast<long long>(settling));
+    }
     if (release->installerUrl.empty())
     {
         std::puts("  installer: none attached, so this release can only be downloaded by hand");

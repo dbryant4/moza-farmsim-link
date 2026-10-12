@@ -135,6 +135,7 @@ constexpr const char* kLightsColorKey  = "lights.color_shift";
 constexpr const char* kLightsFromKey   = "lights.color_from";
 constexpr const char* kSwayKey         = "pitch.accel_sway";
 constexpr const char* kUpdatesKey      = "updates.check";
+constexpr const char* kPrereleasesKey  = "updates.prereleases";
 constexpr const char* kPatternsKey     = "surfaces.patterns";
 
 void registerSettings(Settings& settings)
@@ -180,6 +181,10 @@ void registerSettings(Settings& settings)
                        "Once a day the program by the clock asks GitHub whether a newer release exists and tells you. Nothing is "
                        "downloaded or installed until you pick it from the icon's menu.",
                        true);
+    settings.addToggle(kPrereleasesKey, "Updates", "Include pre-releases",
+                       "Also offer versions published as pre-releases: newer, and less tried. Turning this off again does not go "
+                       "back to an older version; you stay on what you have until a newer normal release is out.",
+                       false);
 }
 
 ForceSettings forceSettingsFrom(const Settings& settings)
@@ -504,9 +509,11 @@ int runLink(moza::as::Wheelbase& base, const moza::HidDevice& hid, const LinkOpt
         status.add("bridge.version", "Bridge", "Version");
         status.setText("bridge.version", options.versionText());
     }
-    if (options.checkForUpdates != nullptr)
+    bool checkUpdates = settings.enabled(kUpdatesKey);
+    bool prereleases  = settings.enabled(kPrereleasesKey);
+    if (options.onUpdateSettings)
     {
-        *options.checkForUpdates = settings.enabled(kUpdatesKey);
+        options.onUpdateSettings(checkUpdates, prereleases);
     }
 
     WebUi ui(settings, status, options.settingsPath);
@@ -570,14 +577,22 @@ int runLink(moza::as::Wheelbase& base, const moza::HidDevice& hid, const LinkOpt
     DeviceForces sent;
     PitchServo   servo;
     double       pitchPush   = 0.0;
-    YokeLights   lights;
+    // Beside the settings file: what the handle's lights were before this program changed them.
+    YokeLights   lights(options.settingsPath.empty() ? std::filesystem::path() : options.settingsPath.parent_path() / "yoke_lights_original.txt");
     auto         nextLightsAttach = start;
     int          sendErrors    = 0;
     bool         forcesWereOn  = status.forcesEnabled();
     TelemetryView view;
 
+    const auto alive = [&] {
+        if (options.onLoop)
+        {
+            options.onLoop();
+        }
+    };
     while (!stop)
     {
+        alive();
         const auto now = Clock::now();
         if (options.seconds > 0 && std::chrono::duration<double>(now - start).count() >= options.seconds)
         {
@@ -655,7 +670,8 @@ int runLink(moza::as::Wheelbase& base, const moza::HidDevice& hid, const LinkOpt
 
         // The lights are only touched once the user has asked for them to follow the engine.
         const LightTuning lightTuning = lightTuningFrom(settings);
-        if (lightTuning.followEngine && !lights.attached() && now >= nextLightsAttach)
+        // ... or once an earlier run has left them changed, to put them back.
+        if (!lights.attached() && now >= nextLightsAttach && (lightTuning.followEngine || lights.restorePending()))
         {
             lights.attach();
             nextLightsAttach = now + std::chrono::seconds(3);
@@ -723,9 +739,12 @@ int runLink(moza::as::Wheelbase& base, const moza::HidDevice& hid, const LinkOpt
             {
                 status.setText("bridge.version", options.versionText());
             }
-            if (options.checkForUpdates != nullptr)
+            if (options.onUpdateSettings &&
+                (settings.enabled(kUpdatesKey) != checkUpdates || settings.enabled(kPrereleasesKey) != prereleases))
             {
-                *options.checkForUpdates = settings.enabled(kUpdatesKey);
+                checkUpdates = settings.enabled(kUpdatesKey);
+                prereleases  = settings.enabled(kPrereleasesKey);
+                options.onUpdateSettings(checkUpdates, prereleases);
             }
             nextStatus = now + statusInterval;
         }
@@ -755,10 +774,15 @@ int runLink(moza::as::Wheelbase& base, const moza::HidDevice& hid, const LinkOpt
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 
+    // Each of these talks to something that can fail to answer; the guard hears about every step.
+    alive();
     ui.stop();
     presence.remove();
+    alive();
     lights.restore();
+    alive();
     ffb.stop();
+    alive();
     std::printf("Forces released. Updates that failed to send: %d.\n", sendErrors);
     return 0;
 }

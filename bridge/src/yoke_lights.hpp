@@ -4,6 +4,7 @@
 #include "moza/device_as.hpp"
 
 #include <chrono>
+#include <filesystem>
 #include <cstdint>
 
 namespace bridge {
@@ -25,6 +26,11 @@ struct Rgb
  * handle keeps, which MOZA Cockpit also manages, so the values found at attach are restored when
  * this object stops or is destroyed, and writes are kept few: only when a step changes, and not
  * more often than a few times a second.
+ *
+ * A run can end without getting to put them back (the program killed, or stuck and restarted). So
+ * with a memo file given, what was found is also written there before the first change and the
+ * file removed once everything is back; a later run that finds the file restores to what it says
+ * rather than to whatever the lights were left at.
  */
 class YokeLights
 {
@@ -34,6 +40,8 @@ public:
     static constexpr int kBrightest = 15;
 
     YokeLights() = default;
+    /** @p memo is the file that remembers the handle's own settings across a run that ends badly. */
+    explicit YokeLights(std::filesystem::path memo) : m_memo(std::move(memo)) {}
     ~YokeLights() { restore(); }
 
     YokeLights(const YokeLights&)            = delete;
@@ -47,6 +55,11 @@ public:
     bool attach();
 
     bool attached() const { return m_handle.isOpen(); }
+    /**
+     * True while an earlier run's changes are still waiting to be undone and the handle has not
+     * been attached yet: a reason to attach even if nothing else wants the lights.
+     */
+    bool restorePending() const;
     /** The brightness the handle had when it was attached. */
     int original() const { return m_original; }
     /** The brightness last written, or the original if nothing has been. */
@@ -78,6 +91,11 @@ public:
 private:
     bool writeLevel(int level);
     bool writeColor(Rgb color);
+    /** Reads the memo into the originals. False if there is none or it makes no sense. */
+    bool loadMemo();
+    /** Writes the originals to the memo, once, before anything on the handle is changed. */
+    void saveMemo();
+    void dropMemo();
 
     moza::as::Stick   m_handle;
     int               m_original = 0;
@@ -88,6 +106,8 @@ private:
     Rgb               m_color;
     int               m_heatStep = 0;
     Clock::time_point m_lastWrite{};
+    std::filesystem::path m_memo;
+    bool                  m_memoWritten = false;
 };
 
 } // namespace bridge

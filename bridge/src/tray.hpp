@@ -41,10 +41,11 @@ public:
     /** Makes "Open settings" work. Safe from any thread. */
     void setSettingsUrl(const std::string& url);
     /**
-     * Puts a newer version in the menu. @p installable says whether picking it installs it or only
-     * leads to the download page. Safe from any thread.
+     * Puts a newer release in the menu under @p name, which reads on after "Install", for example
+     * "version 0.1.3" or "pre-release 0.1.4"; empty takes it out again. @p installable says whether
+     * picking it installs it or only leads to the download page. Safe from any thread.
      */
-    void setUpdate(const std::string& version, bool installable);
+    void setUpdate(const std::string& name, bool installable);
     /** A notification bubble from the icon. Safe from any thread. */
     void notify(const std::string& title, const std::string& text);
 
