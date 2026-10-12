@@ -68,13 +68,13 @@ end
 -- contract checker: asserts a line follows docs/telemetry.md
 ---------------------------------------------------------------------------
 
-local INT_KEYS = { seq = true, t = true, mass = true, rpm = true, rpmmin = true, rpmmax = true, surface = true }
+local INT_KEYS = { seq = true, t = true, mass = true, rpm = true, rpmmin = true, rpmmax = true, surface = true, startms = true }
 local FLAG_KEYS = { active = true, field = true, lowered = true, working = true, starting = true, electric = true, ["end"] = true }
 local RANGES = {
     steer = { -1, 1 }, load = { 0, 1 }, slip = { 0, 1 }, rough = { 0, 1 }, bumpl = { 0, 1 }, bumpr = { 0, 1 },
-    speed = { -200, 200 }, surface = { 1, 8 },
+    speed = { -200, 200 }, surface = { 1, 8 }, rollrate = { -10, 10 }, pitchrate = { -10, 10 }, heave = { -100, 100 },
 }
-local KNOWN_ORDER = { "seq", "t", "active", "speed", "steer", "mass", "rpm", "load", "rpmmin", "rpmmax", "slip", "rough", "surface", "field", "lowered", "working", "starting", "electric", "bumpl", "bumpr", "end" }
+local KNOWN_ORDER = { "seq", "t", "active", "speed", "steer", "mass", "rpm", "load", "rpmmin", "rpmmax", "slip", "rough", "surface", "field", "lowered", "working", "starting", "electric", "bumpl", "bumpr", "rollrate", "pitchrate", "heave", "startms", "end" }
 
 --- @return table of key -> text value
 local function checkLine(line)
@@ -150,6 +150,7 @@ local function resetGameGlobals()
     g_time = nil
     g_fillTypeManager = nil
     localToLocal, getWheelShapeContactForce = nil, nil
+    localDirectionToWorld, getWorldTranslation = nil, nil
     -- the values are arbitrary; only the names are the game's
     MotorState = { OFF = 11, IGNITION = 12, STARTING = 13, ON = 14 }
     slipByShape = {}
@@ -431,7 +432,7 @@ test("the example in docs/telemetry.md is the one tested here", function()
     check(doc:find(contractExample, 1, true) or doc:find(driveExample, 1, true) or doc:find(bumpExample, 1, true)
         or doc:find(rangeExample, 1, true) or doc:find(fullExample, 1, true),
         "docs/telemetry.md no longer contains the example line this test expects")
-    for _, key in ipairs({ "starting", "electric", "bumpl", "bumpr", "rpmmin", "rpmmax", "surface" }) do
+    for _, key in ipairs({ "starting", "electric", "bumpl", "bumpr", "rpmmin", "rpmmax", "surface", "rollrate", "pitchrate", "heave", "startms" }) do
         check(doc:find("| `" .. key .. "` |", 1, true), "the key table lists " .. key)
     end
 end)
@@ -1453,6 +1454,165 @@ test("standing still nothing counts; crawling over a log does", function()
     tractor = settledTractor()
     tractor.lastSignedSpeed = -0.0008 -- reversing over it
     near((bumpFrame(tractor, { 3 })), 0.6, 1e-6, "in reverse")
+end)
+
+test("how long a machine takes to start is passed on when the game says", function()
+    resetGameGlobals()
+    local tractor = newTractor()
+    local _, v, _, info = lineFor(tractor)
+    eq(v.startms, nil, "the game does not say")
+    eq(info.sources.startduration, "not given")
+
+    tractor.spec_motorized.motorStartDuration = 2340.6
+    _, v, _, info = lineFor(tractor)
+    eq(v.startms, "2341") eq(info.sources.startduration, "spec_motorized.motorStartDuration")
+
+    -- values that cannot be a start time are left out rather than passed on
+    for _, odd in ipairs({ 0, -500, 0 / 0, 1 / 0, 900000, "soon", false }) do
+        tractor.spec_motorized.motorStartDuration = odd
+        eq(select(2, lineFor(tractor)).startms, nil, "duration " .. tostring(odd))
+    end
+    tractor.spec_motorized = nil
+    eq(select(2, lineFor(tractor)).startms, nil, "no engine at all")
+end)
+
+realPrint("the machine's own movement")
+
+--- Gives the mocked scene graph a body that can be leaned, tipped and lifted.
+-- roll: leaning to the right, radians; pitch: nose up, radians; height: metres.
+local function newBody(tractor)
+    local body = { roll = 0, pitch = 0, height = 100 }
+    tractor.rootNode = "root"
+    localDirectionToWorld = function(node, x, y, z)
+        check(node == "root", "asked about the root node")
+        if x == 1 then
+            -- the vehicle's left: its tip rises as the machine leans to the right
+            return math.cos(body.roll), math.sin(body.roll), 0
+        end
+        return 0, math.sin(body.pitch), math.cos(body.pitch)
+    end
+    getWorldTranslation = function(node)
+        return 12, body.height, 34
+    end
+    return body
+end
+
+test("rolling, pitching and bouncing are reported as rates, from the driver's seat", function()
+    resetGameGlobals()
+    local tractor = newTractor()
+    local body = newBody(tractor)
+    local FRAME_MS = 1000 / 60
+
+    -- before anything has been followed, and standing still: nothing, then zeros
+    local _, v = lineFor(tractor)
+    eq(v.rollrate, nil, "not followed yet") eq(v.pitchrate, nil) eq(v.heave, nil)
+    T.updateMotion(tractor, FRAME_MS)
+    T.updateMotion(tractor, FRAME_MS)
+    _, v = lineFor(tractor)
+    eq(v.rollrate, "0.00") eq(v.pitchrate, "0.00") eq(v.heave, "0.0")
+
+    -- leaning steadily to the right at 0.5 rad/s, nose rising at 0.2 rad/s
+    for _ = 1, 40 do
+        body.roll = body.roll + 0.5 * FRAME_MS / 1000
+        body.pitch = body.pitch + 0.2 * FRAME_MS / 1000
+        T.updateMotion(tractor, FRAME_MS)
+    end
+    local _, _, sample, info = lineFor(tractor)
+    near(sample.rollrate, 0.5, 0.02, "roll rate") near(sample.pitchrate, 0.2, 0.01, "pitch rate")
+    near(sample.heave, 0, 0.05, "no bounce in that")
+    check(info.sources.motion:find("root node", 1, true), info.sources.motion)
+
+    -- the other way: both negative
+    for _ = 1, 40 do
+        body.roll = body.roll - 0.3 * FRAME_MS / 1000
+        body.pitch = body.pitch - 0.4 * FRAME_MS / 1000
+        T.updateMotion(tractor, FRAME_MS)
+    end
+    sample = select(3, lineFor(tractor))
+    near(sample.rollrate, -0.3, 0.02) near(sample.pitchrate, -0.4, 0.02)
+
+    -- thrown upward: rising faster and faster at 4 m/s^2
+    local rise = 0
+    for _ = 1, 40 do
+        rise = rise + 4 * FRAME_MS / 1000
+        body.height = body.height + rise * FRAME_MS / 1000
+        T.updateMotion(tractor, FRAME_MS)
+    end
+    near(select(3, lineFor(tractor)).heave, 4, 0.3, "heave")
+    -- a steady climb, as up a hill, is no bounce
+    for _ = 1, 60 do
+        body.height = body.height + rise * FRAME_MS / 1000
+        T.updateMotion(tractor, FRAME_MS)
+    end
+    near(select(3, lineFor(tractor)).heave, 0, 0.1, "steady climb")
+
+    -- the frame rate does not change what is reported
+    for _ = 1, 30 do
+        body.roll = body.roll + 0.5 * 0.040
+        T.updateMotion(tractor, 40)
+    end
+    near(select(3, lineFor(tractor)).rollrate, 0.5, 0.03, "at 25 frames a second")
+
+    -- with the seat turned round, the driver's right is the machine's left
+    tractor.spec_reverseDriving = { isReverseDriving = true }
+    near(select(3, lineFor(tractor)).rollrate, -0.5, 0.03, "reverse driving")
+    tractor.spec_reverseDriving = nil
+end)
+
+test("a hitch, a reset or a vehicle with no place in the world is not movement", function()
+    resetGameGlobals()
+    local tractor = newTractor()
+    local body = newBody(tractor)
+    local FRAME_MS = 1000 / 60
+    for _ = 1, 30 do
+        body.roll = body.roll + 0.5 * FRAME_MS / 1000
+        T.updateMotion(tractor, FRAME_MS)
+    end
+    near(select(3, lineFor(tractor)).rollrate, 0.5, 0.02)
+
+    -- the game stood still for half a second, and the machine is somewhere else when it resumes
+    body.roll = body.roll + 0.4
+    T.updateMotion(tractor, 500)
+    local sample = select(3, lineFor(tractor))
+    eq(sample.rollrate, 0, "a hitch starts afresh") eq(sample.heave, 0)
+
+    -- reset to the shop: 40 m up in one frame
+    T.updateMotion(tractor, FRAME_MS)
+    body.height = body.height + 40
+    T.updateMotion(tractor, FRAME_MS)
+    eq(select(3, lineFor(tractor)).heave, 0, "a teleport is not a bounce")
+    T.updateMotion(tractor, FRAME_MS)
+    T.updateMotion(tractor, FRAME_MS)
+    near(select(3, lineFor(tractor)).heave, 0, 0.01, "nor is the frame after it")
+
+    -- a violent tumble is held to what the line can carry
+    for _ = 1, 30 do
+        body.roll = math.sin(_ * 2) * 1.2
+        T.updateMotion(tractor, FRAME_MS)
+    end
+    checkLine((lineFor(tractor)))
+
+    -- odd time steps do no harm
+    for _, dt in ipairs({ 0, -5, 0 / 0, 1 / 0 }) do
+        check(pcall(T.updateMotion, tractor, dt), "dt " .. tostring(dt))
+    end
+    check(pcall(T.updateMotion, tractor, nil), "no dt")
+    checkLine((lineFor(tractor)))
+
+    -- the engine functions missing or raising: the keys are left out, and say why
+    localDirectionToWorld = function() error("no scene graph") end
+    T.updateMotion(tractor, FRAME_MS)
+    local _, v, _, info = lineFor(tractor)
+    eq(v.rollrate, nil) eq(v.pitchrate, nil) eq(v.heave, nil)
+    check(info.sources.motion:find("none", 1, true), info.sources.motion)
+    localDirectionToWorld, getWorldTranslation = nil, nil
+    T.updateMotion(tractor, FRAME_MS)
+    eq(select(2, lineFor(tractor)).rollrate, nil, "no functions at all")
+    tractor.rootNode = nil
+    newBody(tractor)
+    tractor.rootNode = nil
+    T.updateMotion(tractor, FRAME_MS)
+    eq(select(2, lineFor(tractor)).rollrate, nil, "no root node")
 end)
 
 test("slow changes of load are not bumps", function()

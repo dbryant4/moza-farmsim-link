@@ -70,11 +70,19 @@ struct Telemetry
     bool working = false;
     /** The engine is being started: triggered but not yet running. Never set for an electric vehicle. */
     bool starting = false;
+    /** Key `startms`: how long this machine takes to start, ms; 0 when the game does not say. */
+    double startMs = 0.0;
     /** Driven by an electric motor, with no combustion engine. */
     bool electric = false;
     /** How hard the left / right steered wheel is being jolted by an obstacle right now, 0..1. */
     double bumpLeft  = 0.0;
     double bumpRight = 0.0;
+    /** How fast the machine's body is rocking sideways, rad/s; leaning over to the right is positive. */
+    double rollRate = 0.0;
+    /** How fast it is pitching, rad/s; nose rising is positive. */
+    double pitchRate = 0.0;
+    /** Vertical acceleration of the body, m/s^2; upward is positive. */
+    double heave = 0.0;
 
     bool operator==(const Telemetry&) const = default;
 };

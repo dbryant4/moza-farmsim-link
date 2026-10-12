@@ -645,7 +645,7 @@ local function vehicleName(vehicle)
     return tostring(name or vehicle.typeName or "?")
 end
 
-local SOURCE_ORDER = { "speed", "steer", "mass", "engine", "rpmrange", "starting", "electric", "slip", "surface", "implements", "bumps" }
+local SOURCE_ORDER = { "speed", "steer", "mass", "engine", "rpmrange", "starting", "electric", "slip", "surface", "implements", "bumps", "motion", "startduration" }
 
 function Y.logVehicle(vehicle, vehicleSource, sample, info)
     local parts = {}
@@ -770,6 +770,11 @@ function Y.onUpdate(dt)
             Y.logProblem("bumps: " .. tostring(note))
         elseif note ~= nil then
             Y.log(note)
+        end
+        -- How the body moves is a rate of change, so it too is followed on every frame.
+        local okMotion, motionError = pcall(MozaTelemetry.updateMotion, vehicle, dt)
+        if not okMotion then
+            Y.logProblem("motion: " .. tostring(motionError))
         end
     end
 

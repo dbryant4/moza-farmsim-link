@@ -365,6 +365,19 @@ void testDeviceForcesScaleAndRoute()
     CHECK(forces.pull == 1000);
     CHECK(forces.rumble == 500);
 
+    // The machine's own pitching pushes the yoke in and out on top of whatever holds it, and turns
+    // round with the sway when the user has reversed that.
+    output.pitchBounce = 0.5;
+    CHECK(bridge::toDeviceForces(output, tuning).pitchPush == -2500);
+    CHECK(bridge::toDeviceForces(output, tuning, 0.2).pitchPush == -3500);
+    CHECK(bridge::toDeviceForces(output, tuning, 0.9).pitchPush == -5000);
+    tuning.flipSway = true;
+    CHECK(bridge::toDeviceForces(output, tuning).pitchPush == 2500);
+    tuning.flipSway    = false;
+    output.pitchBounce = std::nan("");
+    CHECK(bridge::toDeviceForces(output, tuning).pitchPush == 0);
+    output.pitchBounce = 0.0;
+
     // The ground's texture scales the rumble and nothing else; a value that is not a number leaves it alone.
     output.rumbleTexture = 0.4;
     forces               = bridge::toDeviceForces(output, tuning);

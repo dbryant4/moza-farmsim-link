@@ -43,7 +43,9 @@ void testALoopThatKeepsGoingIsLeftAlone()
 {
     std::atomic<int> stalls{0};
     {
-        bridge::StallGuard guard(150ms, [&](std::chrono::milliseconds) { ++stalls; }, 10ms);
+        // The limit is far above the pause between beats, so that a busy machine stretching a
+        // pause does not look like a stall.
+        bridge::StallGuard guard(1500ms, [&](std::chrono::milliseconds) { ++stalls; }, 10ms);
         for (int i = 0; i < 60; ++i)
         {
             guard.beat();

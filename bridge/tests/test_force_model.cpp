@@ -156,6 +156,14 @@ void testIgnoresUnknownKeysAndDefaultsMissingOnes()
     CHECK(ranged && ranged->rpmMin == 850.0 && ranged->rpmMax == 1900.0 && ranged->rpm == 1400.0);
     CHECK(onFoot && onFoot->rpmMin == 0.0 && onFoot->rpmMax == 0.0);
 
+    const auto slowStarter = parseTelemetry("MOZAFS 1 seq=8 active=1 starting=1 startms=2340 end=1\n");
+    CHECK(slowStarter && slowStarter->starting && slowStarter->startMs == 2340.0);
+    CHECK(onFoot && onFoot->startMs == 0.0);
+
+    const auto swaying = parseTelemetry("MOZAFS 1 seq=8 active=1 rollrate=-0.35 pitchrate=0.12 heave=-3.5 end=1\n");
+    CHECK(swaying && swaying->rollRate == -0.35 && swaying->pitchRate == 0.12 && swaying->heave == -3.5);
+    CHECK(onFoot && onFoot->rollRate == 0.0 && onFoot->pitchRate == 0.0 && onFoot->heave == 0.0);
+
     const auto bumped = parseTelemetry("MOZAFS 1 seq=8 active=1 bumpl=0.25 bumpr=1.00 end=1\n");
     CHECK(bumped && bumped->bumpLeft == 0.25 && bumped->bumpRight == 1.0);
     CHECK(onFoot && onFoot->bumpLeft == 0.0 && onFoot->bumpRight == 0.0);
@@ -903,7 +911,11 @@ void testRoughGroundComesAndGoesUnderTheWheels()
     Telemetry loaded        = drivingOn(Surface::Tilled, 4.0, 1.0);
     loaded.load             = 1.0;
     ForceModel   probe(withEngine);
-    const double surfaceShare = (settle(probe, &loaded).rumble - withEngine.engineRumble) / probe.output().rumble;
+    // The engine's part is what is left on ground with no roughness at all.
+    Telemetry smooth = loaded;
+    smooth.rough     = 0.0;
+    const double enginePart   = settled(smooth, withEngine).rumble;
+    const double surfaceShare = (settle(probe, &loaded).rumble - enginePart) / probe.output().rumble;
     CHECK(surfaceShare > 0.2 && surfaceShare < 0.8);
     const Driven shared = drive(loaded, withEngine);
     CHECK(near(1.0 - shared.lowestTexture, surfaceShare * (1.0 - tilled.lowestTexture), 0.02));
@@ -1027,35 +1039,98 @@ void testEngineRumbleIsOptIn()
     // Off by default, whatever the engine is doing.
     Telemetry revving = driving(0.0);
     revving.rpm       = 2200.0;
+    revving.rpmMin    = 850.0;
+    revving.rpmMax    = 2200.0;
     revving.load      = 1.0;
     CHECK(near(settled(revving).rumble, 0.0, 1e-6));
 
     ForceSettings settings;
     settings.engineRumble = 0.10;
+    const double band     = settings.rumbleMaxHz - settings.rumbleMinHz;
+    const double idleShare = settings.engineRumbleIdleShare;
 
-    Telemetry idling = driving(0.0);
-    idling.rpm       = 900.0;
+    // Idling at a standstill: the gentlest it gets, at the slow end of the band.
+    Telemetry idling = revving;
+    idling.rpm       = 850.0;
     idling.load      = 0.0;
     const ForceOutput idle = settled(idling, settings);
-    CHECK(near(idle.rumble, 0.10 * settings.engineRumbleIdleShare, 1e-6));
-    CHECK(near(idle.rumbleHz, 15.0, 1e-6)); // 900 rpm is 15 turns a second
+    CHECK(near(idle.rumble, 0.10 * idleShare, 1e-6));
+    CHECK(near(idle.rumbleHz, settings.rumbleMinHz, 1e-6));
 
+    // Flat out under load but standing still: everything except the part that comes from moving.
     const ForceOutput loaded = settled(revving, settings);
-    CHECK(near(loaded.rumble, 0.10, 1e-6));
-    CHECK(near(loaded.rumbleHz, settings.rumbleMaxHz, 1e-6)); // 36.7 Hz, held to the band
+    CHECK(near(loaded.rumble, 0.10 * (idleShare + (1.0 - idleShare) * (settings.engineRumbleRevShare + settings.engineRumbleLoadShare)), 1e-6));
+    CHECK(near(loaded.rumbleHz, settings.rumbleMinHz + band * (1.0 - settings.engineHzSpeedShare), 1e-6));
 
-    Telemetry stalled = driving(0.0);
+    // Flat out, loaded and at speed on a smooth road: all of it, at the fast end.
+    Telemetry flatOut = revving;
+    flatOut.speed     = settings.rumbleFullSpeed;
+    const ForceOutput most = settled(flatOut, settings);
+    CHECK(near(most.rumble, 0.10, 1e-6));
+    CHECK(near(most.rumbleHz, settings.rumbleMaxHz, 1e-6));
+
+    // It follows the revs: stronger and faster all the way up, with nothing else changing.
+    double lastRumble = 0.0;
+    double lastHz     = 0.0;
+    for (const double rpm : {850.0, 1100.0, 1400.0, 1800.0, 2200.0})
+    {
+        Telemetry at = idling;
+        at.rpm       = rpm;
+        const ForceOutput out = settled(at, settings);
+        CHECK(out.rumble > lastRumble && out.rumbleHz > lastHz);
+        lastRumble = out.rumble;
+        lastHz     = out.rumbleHz;
+    }
+    // ... and the pace of the machine, at the same revs, on a road that adds no rumble of its own.
+    Telemetry cruising = idling;
+    cruising.rpm       = 1500.0;
+    Telemetry faster   = cruising;
+    cruising.speed     = 2.0;
+    faster.speed       = 7.0;
+    CHECK(settled(faster, settings).rumble > settled(cruising, settings).rumble);
+    CHECK(settled(faster, settings).rumbleHz > settled(cruising, settings).rumbleHz);
+    // ... and the load.
+    Telemetry pulling = cruising;
+    pulling.load      = 1.0;
+    CHECK(settled(pulling, settings).rumble > settled(cruising, settings).rumble);
+    CHECK(near(settled(pulling, settings).rumbleHz, settled(cruising, settings).rumbleHz, 1e-9));
+
+    // Each machine's own range counts: 2000 turns is flat out for a combine and half way for a small utility vehicle.
+    Telemetry combine = idling;
+    combine.rpm       = 2000.0;
+    combine.rpmMin    = 900.0;
+    combine.rpmMax    = 2000.0;
+    Telemetry utility = combine;
+    utility.rpmMin    = 850.0;
+    utility.rpmMax    = 5750.0;
+    CHECK(settled(combine, settings).rumbleHz > settled(utility, settings).rumbleHz + 3.0);
+    CHECK(settled(combine, settings).rumble > settled(utility, settings).rumble);
+    // A machine that does not say gets an ordinary tractor's range, and nonsense does no harm.
+    Telemetry unknown = combine;
+    unknown.rpmMin    = 0.0;
+    unknown.rpmMax    = 0.0;
+    CHECK(near(settled(unknown, settings).rumbleHz, settled(revving, settings).rumbleHz - band * (1.0 - settings.engineHzSpeedShare) * (200.0 / 1350.0), 1e-6));
+    Telemetry backwards = combine;
+    backwards.rpmMin    = 3000.0;
+    backwards.rpmMax    = 1000.0;
+    CHECK(withinRanges(settled(backwards, settings), settings));
+
+    Telemetry stalled = idling;
     stalled.rpm       = 0.0;
     CHECK(near(settled(stalled, settings).rumble, 0.0, 1e-6));
 
     // With surface rumble as well, the two add and the frequency lies between their own.
-    Telemetry rolling = driving(8.0);
+    Telemetry rolling = idling;
+    rolling.speed     = 8.0;
     rolling.rough     = 1.0;
-    rolling.rpm       = 900.0;
-    rolling.load      = 0.0;
-    const ForceOutput both = settled(rolling, settings);
-    CHECK(near(both.rumble, settings.rumbleSurface + 0.05, 1e-6));
-    CHECK(both.rumbleHz > 15.0 && both.rumbleHz < settled(rolling).rumbleHz);
+    const ForceOutput both       = settled(rolling, settings);
+    const ForceOutput groundOnly = settled(rolling);
+    Telemetry         smooth     = rolling;
+    smooth.rough                 = 0.0;
+    const ForceOutput engineOnly = settled(smooth, settings);
+    CHECK(near(groundOnly.rumble, settings.rumbleSurface, 1e-6));
+    CHECK(near(both.rumble, groundOnly.rumble + engineOnly.rumble, 1e-6));
+    CHECK(both.rumbleHz > engineOnly.rumbleHz && both.rumbleHz < groundOnly.rumbleHz);
 }
 
 /** Feeds @p telemetry for @p seconds in 10 ms steps and returns the strongest rumble seen. */
@@ -1085,24 +1160,101 @@ void testEngineStartShakes()
     ForceModel model(settings);
     CHECK(near(settle(model, &off).rumble, 0.0, 1e-6));
 
-    // While the start lasts, the shake holds at its own strength and its own slow frequency.
-    const ForceOutput started = settle(model, &cranking, 2.0);
-    CHECK(near(started.rumble, settings.engineStartShake, 1e-3));
+    // As the start begins, the shake comes in at its own strength and its own slow frequency.
+    const ForceOutput started = settle(model, &cranking, 0.8);
+    CHECK(near(started.rumble, settings.engineStartShake, 0.01));
     CHECK(near(started.rumbleHz, settings.engineStartHz, 0.05));
     CHECK(started.rumble > 3.0 * settings.engineRumble);
 
-    // Once the engine runs, the shake dies away to the ordinary idle rumble rather than cutting off.
+    // An engine that catches quickly: the shake dies away to the ordinary idle rumble rather than cutting off.
     const double justAfter = model.update(&idling, 0.01).rumble;
     CHECK(justAfter > 0.5 * settings.engineStartShake);
     const ForceOutput running = settle(model, &idling, 5.0);
     CHECK(near(running.rumble, settings.engineRumble * settings.engineRumbleIdleShare, 1e-4));
-    CHECK(near(running.rumbleHz, 850.0 / 60.0, 0.05));
+    CHECK(near(running.rumbleHz, settings.rumbleMinHz, 0.05));
+
+    // A start the game draws out for three seconds: the shake has made its point and gone well
+    // before that, within the length it is allowed, and does not come back when the engine catches.
+    ForceModel drawnOut(settings);
+    settle(drawnOut, &off, 1.0);
+    double       shakenFor = 0.0;
+    const double step      = 0.01;
+    for (int i = 0; i < 300; ++i)
+    {
+        shakenFor += drawnOut.update(&cranking, step).rumble > 0.05 * settings.engineStartShake ? step : 0.0;
+    }
+    CHECK(shakenFor > 0.7 * settings.engineStartSeconds && shakenFor < settings.engineStartSeconds + 0.4);
+    CHECK(near(drawnOut.output().rumble, 0.0, 1e-3));
+    CHECK(peakRumble(drawnOut, idling, 2.0) < settings.engineRumble + 1e-6);
+    // The next start shakes again.
+    settle(drawnOut, &off, 1.0);
+    CHECK(near(settle(drawnOut, &cranking, 0.8).rumble, settings.engineStartShake, 0.01));
+    // Half the length, half the shake; and no limit at all lasts as long as the game's start does.
+    const auto shakeTime = [&](double length) {
+        ForceSettings timed      = settings;
+        timed.engineStartSeconds = length;
+        ForceModel timedModel(timed);
+        settle(timedModel, &off, 1.0);
+        double total = 0.0;
+        for (int i = 0; i < 300; ++i)
+        {
+            total += timedModel.update(&cranking, step).rumble > 0.05 * timed.engineStartShake ? step : 0.0;
+        }
+        return total;
+    };
+    CHECK(shakeTime(0.8) < 0.7 * shakeTime(1.5));
+    CHECK(shakeTime(0.0) > 2.9);
+
+    // A machine that says how long its start takes is shaken for a share of that, not for a fixed time:
+    // half by default, so a slow-starting machine shakes for longer than a quick one.
+    const auto shakeTimeFor = [&](double startMs, double share) {
+        ForceSettings timed    = settings;
+        timed.engineStartShare = share;
+        Telemetry turning      = cranking;
+        turning.startMs        = startMs;
+        Telemetry before       = off;
+        before.startMs         = startMs;
+        ForceModel timedModel(timed);
+        settle(timedModel, &before, 1.0);
+        double total = 0.0;
+        // The game keeps the engine starting for exactly as long as it said.
+        for (int i = 0; i < std::lround(startMs / 10.0); ++i)
+        {
+            total += timedModel.update(&turning, step).rumble > 0.05 * timed.engineStartShake ? step : 0.0;
+        }
+        return total;
+    };
+    CHECK(near(shakeTimeFor(3000.0, 0.5), 1.5, 0.35));
+    CHECK(near(shakeTimeFor(1600.0, 0.5), 0.8, 0.35));
+    CHECK(shakeTimeFor(3000.0, 0.5) > shakeTimeFor(1600.0, 0.5) + 0.4);
+    CHECK(shakeTimeFor(3000.0, 1.0) > 2.7);
+    CHECK(shakeTimeFor(3000.0, 0.25) < shakeTimeFor(3000.0, 0.5) - 0.4);
+    // The fixed length only stands in when the game does not say.
+    ForceSettings longFallback      = settings;
+    longFallback.engineStartSeconds = 5.0;
+    Telemetry known                 = cranking;
+    known.startMs                   = 2000.0;
+    ForceModel informed(longFallback);
+    settle(informed, &off, 1.0);
+    settle(informed, &known, 1.8);
+    CHECK(near(informed.output().rumble, 0.0, 0.01));
+    // Nonsense for a start time is no start time.
+    Telemetry odd = cranking;
+    odd.startMs   = std::numeric_limits<double>::quiet_NaN();
+    ForceModel wary(settings);
+    CHECK(withinRanges(settle(wary, &odd, 0.8), settings));
+    odd.startMs = -5.0;
+    ForceModel negative(settings);
+    settle(negative, &off, 1.0);
+    // ... so the fixed length applies: still shaking at 0.8 s, gone by 2 s.
+    CHECK(near(settle(negative, &odd, 0.8).rumble, settings.engineStartShake, 0.01));
+    CHECK(near(settle(negative, &odd, 1.2).rumble, 0.0, 0.01));
 
     // It stands out even with running vibration switched off and the rumble limit turned right down.
     ForceSettings quiet;
     quiet.rumbleMax = 0.0;
     ForceModel capped(quiet);
-    CHECK(near(settle(capped, &cranking, 2.0).rumble, quiet.engineStartShake, 1e-3));
+    CHECK(near(settle(capped, &cranking, 0.8).rumble, quiet.engineStartShake, 0.01));
     CHECK(near(settle(capped, &idling, 5.0).rumble, 0.0, 1e-4));
 
     // Turned off, a start is no different from an engine that is simply off.
@@ -1115,7 +1267,7 @@ void testEngineStartShakes()
     ForceModel   left(settings);
     Telemetry    onFoot;
     onFoot.seq = 2;
-    settle(left, &cranking, 2.0);
+    settle(left, &cranking, 0.8);
     settle(left, &onFoot, 3.0);
     CHECK(near(peakRumble(left, off, 1.0), 0.0, 1e-6));
 
@@ -1347,6 +1499,84 @@ ForceOutput accelerate(ForceModel& model, double fromSpeed, double accel, double
         model.update(&telemetry, 0.009);
     }
     return model.output();
+}
+
+void testTheMachinesOwnMovementIsFelt()
+{
+    const ForceSettings settings;
+
+    // Standing or rolling on even ground, the body is still and nothing is added.
+    const ForceOutput even = settled(driving(6.0));
+    CHECK(near(even.rollKick, 0.0, 1e-9) && near(even.pitchBounce, 0.0, 1e-9));
+
+    // Rocking over to the right: the wheel is pushed to the left, in proportion, up to the full rate.
+    Telemetry rocking = driving(6.0);
+    rocking.rollRate  = 0.25;
+    const ForceOutput right = settled(rocking);
+    CHECK(near(right.rollKick, -settings.bodyRock * 0.25 / settings.bodyRockFullRate, 1e-6));
+    rocking.rollRate = -0.25;
+    CHECK(near(settled(rocking).rollKick, -right.rollKick, 1e-9));
+    rocking.rollRate = 5.0;
+    CHECK(near(settled(rocking).rollKick, -settings.bodyRock, 1e-6));
+    // It is what the body does that counts, not what the machine weighs: a heavy one that rocks as much, pushes as much.
+    Telemetry heavy = driving(6.0);
+    heavy.mass      = 30000.0;
+    heavy.rollRate  = 0.25;
+    CHECK(near(settled(heavy).rollKick, right.rollKick, 1e-9));
+    // It leaves the steering's own pull and the rumble alone.
+    CHECK(near(right.rollForce, even.rollForce, 1e-9) && near(right.rumble, even.rumble, 1e-9) && near(right.pitchTarget, even.pitchTarget, 1e-9));
+
+    // Pitching and bouncing go to the yoke's in-and-out, each for half.
+    Telemetry pitching = driving(6.0);
+    pitching.pitchRate = settings.bodyPitchFullRate;
+    CHECK(near(settled(pitching).pitchBounce, 0.5 * settings.bodyBounce, 1e-6));
+    Telemetry bouncing = driving(6.0);
+    bouncing.heave     = -settings.bodyHeaveFull;
+    CHECK(near(settled(bouncing).pitchBounce, -0.5 * settings.bodyBounce, 1e-6));
+    Telemetry both = pitching;
+    both.heave     = 100.0;
+    CHECK(near(settled(both).pitchBounce, settings.bodyBounce, 1e-6));
+    CHECK(near(settled(pitching).rollKick, 0.0, 1e-9));
+
+    // It follows the body quickly: a rock that lasts a tenth of a second is nearly all there by its end.
+    ForceModel quick;
+    Telemetry  still = driving(6.0);
+    settle(quick, &still, 2.0);
+    rocking.rollRate = 0.25;
+    for (int i = 0; i < 10; ++i)
+    {
+        quick.update(&rocking, 0.01);
+    }
+    CHECK(std::abs(quick.output().rollKick) > 0.9 * std::abs(right.rollKick));
+    // ... and is gone as quickly when the body settles, or the player gets out.
+    for (int i = 0; i < 10; ++i)
+    {
+        quick.update(&still, 0.01);
+    }
+    CHECK(std::abs(quick.output().rollKick) < 0.1 * std::abs(right.rollKick));
+    Telemetry onFoot;
+    onFoot.seq = 2;
+    settle(quick, &rocking, 1.0);
+    CHECK(near(settle(quick, &onFoot, 1.0).rollKick, 0.0, 1e-6) && near(quick.output().pitchBounce, 0.0, 1e-6));
+
+    // Switched off, and with nonsense from the game.
+    ForceSettings off;
+    off.bodyRock   = 0.0;
+    off.bodyBounce = 0.0;
+    rocking.pitchRate = 1.0;
+    CHECK(near(settled(rocking, off).rollKick, 0.0, 1e-9) && near(settled(rocking, off).pitchBounce, 0.0, 1e-9));
+    Telemetry wild = driving(6.0);
+    wild.rollRate  = std::numeric_limits<double>::quiet_NaN();
+    wild.pitchRate = std::numeric_limits<double>::infinity();
+    wild.heave     = -std::numeric_limits<double>::infinity();
+    const ForceOutput safe = settled(wild);
+    CHECK(withinRanges(safe) && std::isfinite(safe.rollKick) && std::abs(safe.rollKick) <= 1.0 && std::isfinite(safe.pitchBounce) &&
+          std::abs(safe.pitchBounce) <= 1.0);
+    ForceSettings zeroRates;
+    zeroRates.bodyRockFullRate  = 0.0;
+    zeroRates.bodyPitchFullRate = 0.0;
+    zeroRates.bodyHeaveFull     = 0.0;
+    CHECK(near(settled(rocking, zeroRates).rollKick, 0.0, 1e-9) && near(settled(rocking, zeroRates).pitchBounce, 0.0, 1e-9));
 }
 
 void testPitchLeansWithAcceleration()
@@ -1920,6 +2150,7 @@ int main()
     testAWheelHittingSomethingKicksTowardThatSide();
     testTheKickShrinksAsTheMachineGetsHeavier();
     testBothWheelsTogetherShakeInsteadOfKicking();
+    testTheMachinesOwnMovementIsFelt();
     testPitchLeansWithAcceleration();
     testPitchServoMovesAStickyAxisWithoutHunting();
     testPitchIsHeldRegardlessOfTelemetry();

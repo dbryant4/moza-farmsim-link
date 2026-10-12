@@ -1573,6 +1573,9 @@ int main(int argc, char** argv)
         status.set("force.centering", 33.0);
         status.set("force.rumble", 16.0);
         status.set("force.rumble_hz", 14.0);
+        status.set("game.rock", -6.5);
+        status.set("game.pitching", 3.0);
+        status.set("game.heave", 1.4);
         bridge::SettingsWindow window;
         if (!options.selfTestSettings.empty())
         {

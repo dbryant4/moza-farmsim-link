@@ -206,6 +206,10 @@ local KEYS = {
     { "electric", flag },
     { "bumpl",   function(v) return M.fmtFixed(clamp(v, 0, 1), 2) end },
     { "bumpr",   function(v) return M.fmtFixed(clamp(v, 0, 1), 2) end },
+    { "rollrate",  function(v) return M.fmtFixed(clamp(v, -9.99, 9.99), 2) end },
+    { "pitchrate", function(v) return M.fmtFixed(clamp(v, -9.99, 9.99), 2) end },
+    { "heave",     function(v) return M.fmtFixed(clamp(v, -99.9, 99.9), 1) end },
+    { "startms",   function(v) return M.fmtInt(clamp(v, 0, 60000)) end },
 }
 
 --- Build the telemetry line (including the trailing "\n").
@@ -712,6 +716,21 @@ M.NON_FUEL_CONSUMERS = { AIR = true } -- compressed air for the brakes
 
 --- Fill type names of everything the vehicle's motor consumes, upper case
 -- and sorted. @return list (possibly empty), source; or nil when unknown
+--- How long this machine takes to start, in ms: the time the game keeps it
+-- in STARTING, which it takes from the length of the machine's start sound.
+-- @return duration (nil when the game does not say), source
+function M.getStartDuration(vehicle)
+    local spec = vehicle.spec_motorized
+    if type(spec) ~= "table" then
+        return nil, nil
+    end
+    local duration = spec.motorStartDuration
+    if isFinite(duration) and duration > 0 and duration <= 60000 then
+        return duration, "spec_motorized.motorStartDuration"
+    end
+    return nil, "not given"
+end
+
 function M.getConsumerNames(vehicle)
     local spec = vehicle.spec_motorized
     if type(spec) ~= "table" then
@@ -1163,6 +1182,90 @@ function M.getBumps(vehicle)
         left, right = right, left
     end
     return left, right, source
+end
+
+---------------------------------------------------------------------------
+-- body motion
+---------------------------------------------------------------------------
+
+-- How the machine itself is moving under the driver: rocking from side to
+-- side, pitching nose up and down, and bouncing. Read from where the
+-- vehicle's root node is and which way it faces, frame by frame, which the
+-- game has on every machine, clients in multiplayer included.
+M.MOTION_SMOOTH_MS = 70     -- low-pass on the three values; one frame's jitter is not motion
+M.MOTION_MAX_GAP_MS = 250   -- a longer frame than this is a hitch: start afresh
+M.MOTION_MAX_JUMP_M = 3     -- further than this in one frame is a reset or a teleport
+
+local function motionStateFor(vehicle)
+    local cache = cacheFor(vehicle)
+    if cache.motion == nil then
+        cache.motion = { have = false, haveSpeed = false, rollRate = 0, pitchRate = 0, heave = 0 }
+    end
+    return cache.motion
+end
+
+local function forgetMotion(state, source)
+    state.have, state.haveSpeed = false, false
+    state.rollRate, state.pitchRate, state.heave = 0, 0, 0
+    state.source = source
+end
+
+--- Follow the vehicle's body through one frame (dt in ms).
+function M.updateMotion(vehicle, dt)
+    local state = motionStateFor(vehicle)
+    local root = vehicle.rootNode
+    if root == nil or not isFunc(localDirectionToWorld) or not isFunc(getWorldTranslation) then
+        forgetMotion(state, "none (the vehicle's place in the world cannot be read)")
+        return
+    end
+    -- In the engine a vehicle's own +x points to its left and +z forward.
+    local okLeft, _, leftY = pcall(localDirectionToWorld, root, 1, 0, 0)
+    local okFront, _, frontY = pcall(localDirectionToWorld, root, 0, 0, 1)
+    local okPlace, _, height = pcall(getWorldTranslation, root)
+    if not (okLeft and okFront and okPlace and isFinite(leftY) and isFinite(frontY) and isFinite(height)) then
+        forgetMotion(state, "none (the vehicle's place in the world cannot be read)")
+        return
+    end
+    state.source = "root node, frame by frame"
+
+    -- Leaning right (left side up) is positive roll; nose up is positive pitch.
+    local roll = math.asin(clamp(leftY, -1, 1))
+    local pitch = math.asin(clamp(frontY, -1, 1))
+    local usable = state.have and isFinite(dt) and dt > 0 and dt <= M.MOTION_MAX_GAP_MS
+        and math.abs(height - state.height) <= M.MOTION_MAX_JUMP_M
+    if not usable then
+        state.rollRate, state.pitchRate, state.heave = 0, 0, 0
+        state.haveSpeed = false
+    else
+        local seconds = dt / 1000
+        local blend = 1 - math.exp(-dt / M.MOTION_SMOOTH_MS)
+        local rise = (height - state.height) / seconds
+        state.rollRate = state.rollRate + ((roll - state.roll) / seconds - state.rollRate) * blend
+        state.pitchRate = state.pitchRate + ((pitch - state.pitch) / seconds - state.pitchRate) * blend
+        if state.haveSpeed then
+            state.heave = state.heave + ((rise - state.rise) / seconds - state.heave) * blend
+        end
+        state.rise, state.haveSpeed = rise, true
+    end
+    state.roll, state.pitch, state.height, state.have = roll, pitch, height, true
+end
+
+--- How the body is moving right now, from the driver's seat.
+-- @return rollrate (rad/s, leaning to the right is positive), pitchrate
+--         (rad/s, nose rising is positive), heave (m/s^2, upward is positive),
+--         source; the three are nil when there is nothing to read them from
+function M.getMotion(vehicle)
+    local state = motionStateFor(vehicle)
+    if not state.have then
+        return nil, nil, nil, state.source or "none (not followed yet)"
+    end
+    local roll, pitch = state.rollRate, state.pitchRate
+    -- with the driving position turned round, left and right and front and back swap
+    local reverse = vehicle.spec_reverseDriving
+    if type(reverse) == "table" and reverse.isReverseDriving == true then
+        roll, pitch = -roll, -pitch
+    end
+    return roll, pitch, state.heave, state.source
 end
 
 --- The wheels the engine drives, from the differentials.
@@ -1635,6 +1738,20 @@ function M.gather(vehicle)
         if isFinite(left) then sample.bumpl = left end
         if isFinite(right) then sample.bumpr = right end
         info.sources.bumps = source
+    end)
+
+    try("startduration", function()
+        local duration, source = M.getStartDuration(vehicle)
+        if isFinite(duration) then sample.startms = duration end
+        info.sources.startduration = source
+    end)
+
+    try("motion", function()
+        local roll, pitch, heave, source = M.getMotion(vehicle)
+        if isFinite(roll) then sample.rollrate = roll end
+        if isFinite(pitch) then sample.pitchrate = pitch end
+        if isFinite(heave) then sample.heave = heave end
+        info.sources.motion = source
     end)
 
     return sample, info

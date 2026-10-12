@@ -215,6 +215,7 @@ ForceOutput ForceModel::update(const Telemetry* telemetry, double dtSeconds)
     next.pitchThump  = approach(m_output.pitchThump, goal.pitchThump, s.kickSmoothing, dt);
     next.rollWiggle  = approach(m_output.rollWiggle, goal.rollWiggle, s.kickSmoothing, dt);
     next.bumpHz      = goal.bumpHz;
+    next.pitchBounce = approach(m_output.pitchBounce, goal.pitchBounce, s.kickSmoothing, dt);
     next.pitchTarget = approach(m_output.pitchTarget, goal.pitchTarget, s.swaySmoothing, dt);
 
     m_output = clamped(next);
@@ -223,20 +224,38 @@ ForceOutput ForceModel::update(const Telemetry* telemetry, double dtSeconds)
 
 void ForceModel::trackEngineStart(const Telemetry* telemetry, double dt)
 {
-    const ForceSettings& s = m_settings;
+    const ForceSettings& s      = m_settings;
+    const bool           starts = telemetry != nullptr && telemetry->active && !telemetry->electric && telemetry->starting;
+    // How long the shake is to last: a share of this machine's own start where the game gives it.
+    const double startSeconds = telemetry != nullptr ? sanitize(telemetry->startMs, 0.0, 60000.0) / 1000.0 : 0.0;
+    const double length       = startSeconds > 0.0 ? unit(s.engineStartShare) * startSeconds : std::max(0.0, s.engineStartSeconds);
+    const bool   unlimited    = !(startSeconds > 0.0) && !(s.engineStartSeconds > 0.0);
+    const double fadeSeconds  = unlimited ? std::max(0.0, s.engineStartFadeSeconds) : std::min(std::max(0.0, s.engineStartFadeSeconds), length / 2.0);
+    const auto   fade         = [&] { m_startShake = fadeSeconds > 0.0 ? std::max(0.0, m_startShake - dt / fadeSeconds) : 0.0; };
     if (telemetry == nullptr || !telemetry->active || telemetry->electric)
     {
         m_startShake = 0.0;
     }
-    else if (telemetry->starting)
+    else if (starts)
     {
-        m_startShake = 1.0;
+        m_startElapsed = m_starting ? m_startElapsed + dt : 0.0;
+        // Full strength until it is time to start dying away, so as to be done within its allotted length.
+        const double hold = std::max(0.0, length - fadeSeconds);
+        if (unlimited || m_startElapsed <= hold)
+        {
+            m_startShake = 1.0;
+        }
+        else
+        {
+            fade();
+        }
     }
     else
     {
         // The engine has caught (or the start was abandoned): let the shake die away, not cut off.
-        m_startShake = s.engineStartFadeSeconds > 0.0 ? std::max(0.0, m_startShake - dt / s.engineStartFadeSeconds) : 0.0;
+        fade();
     }
+    m_starting = starts;
 }
 
 void ForceModel::trackAcceleration(const Telemetry* telemetry, double dt)
@@ -394,6 +413,15 @@ ForceOutput ForceModel::target(const Telemetry* telemetry) const
     out.pitchThump      = unit(s.bumpThump) * shared;
     out.rollWiggle      = unit(s.bumpWiggle) * lightness * shared;
 
+    // The body's own movement. Leaning over to the right is positive and so is a push of the wheel
+    // to the right, hence the minus: the wheel goes with the side that is rising, as it does when
+    // that side's wheel climbs something and the kick above fires.
+    const double rockShare   = s.bodyRockFullRate > 0.0 ? sanitize(telemetry->rollRate / s.bodyRockFullRate, -1.0, 1.0) : 0.0;
+    out.rollKick            -= unit(s.bodyRock) * rockShare;
+    const double pitchShare  = s.bodyPitchFullRate > 0.0 ? sanitize(telemetry->pitchRate / s.bodyPitchFullRate, -1.0, 1.0) : 0.0;
+    const double heaveShare  = s.bodyHeaveFull > 0.0 ? sanitize(telemetry->heave / s.bodyHeaveFull, -1.0, 1.0) : 0.0;
+    out.pitchBounce          = unit(s.bodyBounce) * sanitize(0.5 * pitchShare + 0.5 * heaveShare, -1.0, 1.0);
+
     const double bandLow  = std::min(s.rumbleMinHz, s.rumbleMaxHz);
     const double bandHigh = std::max(s.rumbleMinHz, s.rumbleMaxHz);
 
@@ -416,11 +444,19 @@ ForceOutput ForceModel::target(const Telemetry* telemetry) const
     const double surface      = s.rumbleSurface * std::max(rough, ground.minRough) * groundStrength * easeToFull(speed, s.rumbleFullSpeed) * workingBoost;
     const double hzShare      = s.rumbleHzFullSpeed > 0.0 ? std::min(speed / s.rumbleHzFullSpeed, 1.0) : 1.0;
     const double surfaceHz    = s.rumbleMinHz + (s.rumbleMaxHz - s.rumbleMinHz) * (ground.hzFrom + (ground.hzTo - ground.hzFrom) * hzShare);
-    const double engineShare  = s.engineRumbleIdleShare + (1.0 - s.engineRumbleIdleShare) * load;
+    // Where the engine is between this machine's idle and flat out, and how fast the machine is going.
+    const double idleRpm      = telemetry->rpmMin > 0.0 ? sanitize(telemetry->rpmMin, 1.0, kMaxRpm) : s.engineIdleRpm;
+    const double reportedFull = telemetry->rpmMax > 0.0 ? sanitize(telemetry->rpmMax, 1.0, kMaxRpm) : s.engineFullRpm;
+    const double fullRpm      = reportedFull > idleRpm ? reportedFull : idleRpm + 1.0;
+    const double revs         = unit((rpm - idleRpm) / (fullRpm - idleRpm));
+    const double pace         = easeToFull(speed, s.rumbleFullSpeed);
+    const double effort       = unit(s.engineRumbleRevShare * revs + s.engineRumbleLoadShare * load + s.engineRumbleSpeedShare * pace);
+    const double engineShare  = unit(s.engineRumbleIdleShare) + (1.0 - unit(s.engineRumbleIdleShare)) * effort;
     // An electric motor has no firing strokes to feel; what is left for it is the ground.
     const bool   combustion   = !telemetry->electric;
     const double engine       = combustion && rpm > 0.0 ? s.engineRumble * engineShare : 0.0;
-    const double engineHz     = sanitize(rpm / 60.0, bandLow, bandHigh);
+    const double hzSpeedShare = unit(s.engineHzSpeedShare);
+    const double engineHz     = bandLow + (bandHigh - bandLow) * unit((1.0 - hzSpeedShare) * revs + hzSpeedShare * pace);
     const double starting     = combustion ? unit(s.engineStartShake) * m_startShake : 0.0;
     const double startingHz   = sanitize(s.engineStartHz, bandLow, bandHigh);
 
@@ -464,6 +500,7 @@ ForceOutput ForceModel::clamped(ForceOutput output) const
     output.pitchThump  = unit(output.pitchThump);
     output.rollWiggle  = unit(output.rollWiggle);
     output.bumpHz      = sanitize(m_settings.bumpShakeHz, 2.0, 40.0);
+    output.pitchBounce = sanitize(output.pitchBounce, -1.0, 1.0);
     output.pitchTarget = sanitize(output.pitchTarget, -1.0, 1.0);
     output.rumbleHz    = sanitize(output.rumbleHz, std::min(m_settings.rumbleMinHz, m_settings.rumbleMaxHz),
                                   std::max(m_settings.rumbleMinHz, m_settings.rumbleMaxHz));

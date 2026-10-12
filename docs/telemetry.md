@@ -50,6 +50,7 @@ MOZAFS 1 seq=4821 t=913400 active=1 speed=5.42 steer=-0.250 mass=8200 rpm=1450 l
 | `lowered` | 0/1 | 0 | 1 while any attached implement is lowered. |
 | `working` | 0/1 | 0 | 1 while any attached implement is actively working the ground. |
 | `starting` | 0/1 | 0 | 1 while the engine is being started: from the moment the start is triggered until the engine is running. Never 1 for an electric vehicle. |
+| `startms` | integer ms | 0 | How long this machine takes to start: the time `starting` stays 1 for one start. 0 or missing means the game does not say. The bridge uses it to time its start-up shake to the machine. |
 | `electric` | 0/1 | 0 | 1 when the vehicle is driven by an electric motor and has no combustion engine. `rpm` and `load` are still reported for it; the bridge uses this flag to leave out engine vibration. |
 | `bumpl` | 0..1 | 0 | How hard the **left** steered wheel is being jolted by something under it right now, e.g. climbing a log, a kerb or a rock: 0 on even ground, about 0.3 a clear bump, 1 a violent hit. Left and right are from the driver's seat. |
 | `bumpr` | 0..1 | 0 | The same for the **right** steered wheel. |
@@ -73,6 +74,21 @@ kind its own feel rather than the same rumble at different strengths. The number
 With wheels on different ground, the kind most of them are on is sent, and on an even split the
 rougher of the two. A reader must treat a missing key, and any number it does not know, as
 "unknown" and fall back to a plain rumble scaled by `rough`: later versions may add kinds.
+
+### The machine's own movement
+
+| Key | Unit | Default | Meaning |
+|---|---|---|---|
+| `rollrate` | rad/s, signed | 0 | How fast the machine is rocking sideways. **Positive is leaning over to the right** (its left side rising). |
+| `pitchrate` | rad/s, signed | 0 | How fast it is pitching. Positive is the nose rising. |
+| `heave` | m/s², signed | 0 | Vertical acceleration of the machine's body. Positive is upward. A steady climb is 0. |
+
+These describe the body the driver sits in, not the wheels: what is seen as the cab swaying
+against the horizon when driving off road. The mod takes them from where the vehicle is and which
+way it faces on each frame, smooths them over about 70 ms, and reports them from the driver's
+seat (with the seat turned round, left and right and front and back swap). They are left out when
+the game does not give the vehicle's place in the world. A frame longer than a quarter of a
+second, or a jump of more than 3 m, counts as a hitch or a reset and starts them again from 0.
 
 ### Bumps
 

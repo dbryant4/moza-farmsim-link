@@ -142,6 +142,10 @@ std::optional<Telemetry> parseTelemetry(std::string_view line)
         else if (key == "electric") sample.electric = parseFlag(value, defaults.electric);
         else if (key == "bumpl") sample.bumpLeft = parseReal(value).value_or(defaults.bumpLeft);
         else if (key == "bumpr") sample.bumpRight = parseReal(value).value_or(defaults.bumpRight);
+        else if (key == "rollrate") sample.rollRate = parseReal(value).value_or(defaults.rollRate);
+        else if (key == "pitchrate") sample.pitchRate = parseReal(value).value_or(defaults.pitchRate);
+        else if (key == "heave") sample.heave = parseReal(value).value_or(defaults.heave);
+        else if (key == "startms") sample.startMs = parseReal(value).value_or(defaults.startMs);
     }
 
     if (!haveSeq)

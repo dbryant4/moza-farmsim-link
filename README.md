@@ -244,9 +244,17 @@ spring scale 34%, damper scale 20%, torque limit 100%).
   second SDK thread waiting to write, and this program's loop waiting to read in
   `RawParameter::getValue()`. A read/write lock that has a writer waiting lets no further reader
   in, so none of the three could ever move. None of this program's code was in the SDK threads'
-  call chains. *Lights follow the engine* was on, which opens a second device (the handle) and so
-  gives the SDK a second stream of messages to race on; it had never happened with the base alone,
-  but that link is a suspicion, not a finding. Since nothing can free a thread stuck like that, the
+  call chains. A second snapshot on 2026-10-12 showed the same three places. Both SDK threads were
+  each handling a message that had just come in from a device: the SDK takes the lock to store a
+  reply, lets it go, then takes it for reading twice over while telling its listeners, and a
+  second reply arriving on another thread in between is what jams it. So what it takes is two
+  replies at once. The link was producing those itself: it asked for the motor torque of both
+  axes four times a second for the status display, and with *Lights follow the engine* on it was
+  also writing the handle's brightness and colour as the engine speed moved. Every lock-up seen
+  (seven over two days) happened while driving with the lights setting on, at worst every minute;
+  with it off there were none, including ten hours idle. The torque readout has been taken out of
+  the link loop, so the light writes are now the only replies the link provokes. Whether that is
+  enough for the lights to be safe is not yet known. Since nothing can free a thread stuck like that, the
   link loop is watched (`stall_guard.hpp`): after 10 s without a pass the process ends itself and,
   in the tray program, starts a fresh copy, at most three times in a row.
 
@@ -275,6 +283,15 @@ spring scale 34%, damper scale 20%, torque limit 100%).
      `kPatterns` in `bridge/src/force_model.cpp` and are first guesses: none has been felt on the
      yoke, and whether FS25 reports ridges and tilled ground the way the mod expects is unchecked
      (the settings page shows the reported surface under *Game*).
+   - *Machine movement* (0.1.3): the mod reports how fast the machine's body is rocking, pitching
+     and bouncing (`rollrate`, `pitchrate`, `heave`, from the root node's place and attitude on
+     each frame), and the bridge pushes the wheel and the yoke with it. Not yet run in the game:
+     whether the values are steady enough at the game's frame rate, which way round the pushes
+     should go, and how strong they should be are all first guesses.
+   - *Engine vibration* (0.1.3) follows the revs within each machine's own range, the load and
+     the road speed, in strength and in frequency. The start shake lasts half of each machine's
+     own start, which the mod reads from `spec_motorized.motorStartDuration` (`startms`); that the
+     game fills that field in FS25 is taken from the FS22 source and not yet seen. Untried.
    - *Acceleration sway*: pitch leans out when pulling away and in when braking. Pitch has too
      much friction for a plain push, so a small position controller moves it; it is tuned against
      a simulated axis only.

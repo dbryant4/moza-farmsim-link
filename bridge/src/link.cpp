@@ -67,11 +67,19 @@ const Tunable kTunables[] = {
     {"rumble.working", "Rumble", "Extra while working", "How much stronger the rumble gets while an implement works the ground.", "%", 0, 200,
      5, &ForceSettings::rumbleWorkingBoost, 100},
     {"rumble.engine", "Rumble", "Engine vibration",
-     "Vibration from a running combustion engine, including at a standstill. Electric vehicles have none.", "%", 0, 100, 1,
-     &ForceSettings::engineRumble, 100},
+     "Vibration from a running combustion engine: gentle and slow at idle, stronger and faster as the revs, the load and the "
+     "speed rise. This is its strength flat out. Electric vehicles have none.",
+     "%", 0, 100, 1, &ForceSettings::engineRumble, 100},
+    {"rumble.engine_idle", "Rumble", "Engine vibration at idle",
+     "How much of the engine vibration is left with the engine idling at a standstill.", "%", 0, 100, 5,
+     &ForceSettings::engineRumbleIdleShare, 100},
     {"rumble.engine_start", "Rumble", "Engine start shake",
      "Extra shake while a combustion engine is being started, fading once it runs. Electric vehicles have none.", "%", 0, 100, 1,
      &ForceSettings::engineStartShake, 100},
+    {"rumble.engine_start_share", "Rumble", "Engine start shake length",
+     "How much of the machine's own start the shake lasts for. Each machine takes its own time to start; 100 shakes all the way "
+     "through it.",
+     "% of the start", 10, 100, 5, &ForceSettings::engineStartShare, 100},
     {"rumble.limit", "Rumble", "Rumble limit", "Cap on surface and engine vibration combined; the start shake comes on top.", "%", 0, 100,
      1, &ForceSettings::rumbleMax, 100},
     {"rumble.slow_hz", "Rumble", "Frequency when slow", "Vibration frequency at walking pace.", "Hz", 2, 60, 1, &ForceSettings::rumbleMinHz, 1},
@@ -109,6 +117,16 @@ const Tunable kTunables[] = {
     {"bumps.mass_half", "Bumps", "Mass that halves kick and wiggle",
      "Total mass, with implements, at which the kick and the wiggle are down to half. Lower makes big machines calmer.", "t", 1, 50, 0.5,
      &ForceSettings::bumpKickMassHalf, 0.001},
+
+    {"movement.rock", "Machine movement", "Rocking (wheel left and right)",
+     "The wheel is pushed left and right as the machine itself rocks from side to side, the way the cab sways off road. 0 turns it off.",
+     "%", 0, 100, 1, &ForceSettings::bodyRock, 100},
+    {"movement.bounce", "Machine movement", "Pitching and bouncing (yoke in and out)",
+     "The yoke is pushed in and out as the machine pitches and bounces. It takes a fair amount before the yoke moves. 0 turns it off.",
+     "%", 0, 100, 1, &ForceSettings::bodyBounce, 100},
+    {"movement.rock_full", "Machine movement", "Rocking that gives the full push",
+     "How fast the machine has to rock for the whole of the push above. Lower makes gentle ground count for more.", "deg/s", 5, 90, 1,
+     &ForceSettings::bodyRockFullRate, 57.29577951308232},
 
     {"pitch.hold", "Pitch (in/out)", "Hold stiffness", "How firmly the yoke is held at its center in and out while driving.", "%", 0, 100, 1,
      &ForceSettings::pitchSpring, 100},
@@ -231,13 +249,15 @@ void registerStatus(StatusBoard& status)
     status.addRanged("game.rough", "Game", "Surface roughness", "", 0, 1, 2);
     status.addRanged("game.slip", "Game", "Wheel slip", "", 0, 1, 2);
     status.addRanged("game.bump", "Game", "Wheel bump (left - / right +)", "", -1, 1, 2);
+    status.addRanged("game.rock", "Game", "Rocking (right +)", "deg/s", -40, 40, 1);
+    status.addRanged("game.pitching", "Game", "Pitching (nose up +)", "deg/s", -40, 40, 1);
+    status.addRanged("game.heave", "Game", "Bouncing (up +)", "m/s\xC2\xB2", -8, 8, 1);
     status.add("game.implement", "Game", "Implement");
     status.add("game.engine", "Game", "Engine");
+    status.add("game.start_time", "Game", "Engine takes to start", "s", 1);
 
     status.addRanged("yoke.roll", "Yoke", "Roll position", "", -1, 1, 3);
     status.addRanged("yoke.pitch", "Yoke", "Pitch position", "", -1, 1, 3);
-    status.addRanged("yoke.roll_torque", "Yoke", "Roll motor", "N\xC2\xB7m", -0.5, 0.5, 3);
-    status.addRanged("yoke.pitch_torque", "Yoke", "Pitch motor", "N\xC2\xB7m", -0.5, 0.5, 3);
 
     status.addRanged("force.centering", "Forces", "Centering", "%", 0, 100, 0);
     status.addRanged("force.weight", "Forces", "Weight", "%", 0, 100, 0);
@@ -264,17 +284,6 @@ Condition condition(std::int16_t coefficient, int fullScale)
     result.coefficient = coefficient;
     result.saturation  = static_cast<std::uint16_t>(std::clamp(fullScale, 0, 65535));
     return result;
-}
-
-/** Latest cached torque reading in N*m, or NaN. The SDK hands these back as doubles already in N*m. */
-double cachedTorque(const moza::RawParameter& parameter)
-{
-    auto [err, value] = parameter.getValue();
-    if (err != MOZA_ERR_NO_ERROR)
-    {
-        return std::nan("");
-    }
-    return value.isFloat() ? value.asDouble() : value.asInt() / 10000.0;
 }
 
 const char* surfaceLabel(Surface surface)
@@ -480,7 +489,11 @@ DeviceForces toDeviceForces(const ForceOutput& output, const LinkTuning& tuning,
     // A spring center is a position, so it is not scaled by strength; measured on the AY210, a positive
     // center sits at a higher reported position while a positive constant force pushes toward a lower one.
     forces.pitchCenter = toRaw(pitchTargetFor(output, tuning), tuning.fullScale);
-    forces.pitchPush   = toRaw(-(std::isfinite(pitchPush) ? std::clamp(pitchPush, -1.0, 1.0) : 0.0) * strength, tuning.fullScale);
+    // The machine's own pitching and bouncing comes on top of whatever is holding the yoke in place,
+    // and turns round with the sway if the user has reversed that.
+    const double bounce = (std::isfinite(output.pitchBounce) ? output.pitchBounce : 0.0) * (tuning.flipSway ? -1.0 : 1.0);
+    const double push   = std::clamp((std::isfinite(pitchPush) ? pitchPush : 0.0) + bounce, -1.0, 1.0);
+    forces.pitchPush    = toRaw(-push * strength, tuning.fullScale);
 
     forces.thump  = toRaw(std::clamp(output.pitchThump, 0.0, 1.0) * strength, tuning.fullScale);
     forces.wiggle = toRaw(std::clamp(output.rollWiggle, 0.0, 1.0) * strength, tuning.fullScale);
@@ -574,11 +587,13 @@ int runLink(moza::as::Wheelbase& base, const moza::HidDevice& hid, const LinkOpt
     const auto refreshInterval = std::chrono::milliseconds(200);
     const auto rumbleInterval  = std::chrono::milliseconds(kRumbleDurationMs / 2);
     const auto statusInterval  = std::chrono::milliseconds(100);
-    const auto torqueInterval  = std::chrono::milliseconds(250);
     const auto printInterval   = std::chrono::seconds(1);
 
-    const moza::RawParameter torqueX = base.steerTorqueOutX().raw();
-    const moza::RawParameter torqueY = base.steerTorqueOutY().raw();
+    // The link reads no parameters from the base while it runs. It used to ask for the motor torque
+    // of both axes four times a second, only to show it; the SDK (1.0.0.4) handles each reply on
+    // one of several threads, and two replies handled at once can lock those threads against each
+    // other for good, which took the link down mid-drive. See "The SDK can lock itself up" in the
+    // README. `--list` still prints the torque, once.
 
     const auto   start       = Clock::now();
     auto         lastModel   = start;
@@ -587,7 +602,6 @@ int runLink(moza::as::Wheelbase& base, const moza::HidDevice& hid, const LinkOpt
     auto         nextRefresh = start;
     auto         nextRumble  = start;
     auto         nextStatus  = start;
-    auto         nextTorque  = start;
     auto         nextPrint   = start;
     ForceOutput  output      = model.output();
     DeviceForces sent;
@@ -695,14 +709,6 @@ int runLink(moza::as::Wheelbase& base, const moza::HidDevice& hid, const LinkOpt
         const LightTarget lightTarget = lightTargetFor(view.fresh(), lightTuning);
         lights.show(lightTarget.level, lightTarget.heat, now);
 
-        if (now >= nextTorque)
-        {
-            // Asynchronous: the reply lands in the SDK's cache and is picked up by a later status update.
-            torqueX.fetch();
-            torqueY.fetch();
-            nextTorque = now + torqueInterval;
-        }
-
         if (now >= nextStatus)
         {
             const Telemetry& sample = view.sample;
@@ -715,6 +721,17 @@ int runLink(moza::as::Wheelbase& base, const moza::HidDevice& hid, const LinkOpt
             status.set("game.rough", live ? sample.rough : 0.0);
             status.set("game.slip", live ? sample.slip : 0.0);
             status.set("game.bump", live ? sample.bumpRight - sample.bumpLeft : 0.0);
+            if (live && sample.startMs > 0.0)
+            {
+                status.set("game.start_time", sample.startMs / 1000.0);
+            }
+            else
+            {
+                status.setText("game.start_time", live ? "not given by the game" : "-");
+            }
+            status.set("game.rock", live ? sample.rollRate * 57.29577951308232 : 0.0);
+            status.set("game.pitching", live ? sample.pitchRate * 57.29577951308232 : 0.0);
+            status.set("game.heave", live ? sample.heave : 0.0);
             status.setText("game.implement", !live ? "-" : sample.working ? "working" : sample.lowered ? "lowered" : "raised or none");
             status.setText("game.engine", !live              ? "-"
                                           : sample.electric  ? (sample.rpm > 0.0 ? "electric, on" : "electric, off")
@@ -731,8 +748,6 @@ int runLink(moza::as::Wheelbase& base, const moza::HidDevice& hid, const LinkOpt
                     status.set("yoke.pitch", (state.axes[MOZA_HA_Y].normalizedValue - 0.5) * 2.0);
                 }
             }
-            status.set("yoke.roll_torque", cachedTorque(torqueX));
-            status.set("yoke.pitch_torque", cachedTorque(torqueY));
 
             const double scale = 100.0 / std::max(1, options.fullScale);
             status.set("force.centering", sent.rollSpring * scale);

@@ -21,6 +21,7 @@ struct ForceOutput
     double pitchThump  = 0.0; // 0..1 brief in-out shake on pitch
     double rollWiggle  = 0.0; // 0..1 brief left-right shake on roll
     double bumpHz      = 0.0; // frequency of the thump and the wiggle
+    double pitchBounce = 0.0; // -1..1 force on pitch from the machine's own pitching and bouncing; positive pushes the same way as a positive pitchTarget
     double pitchTarget = 0.0; // -1..1 where pitch should sit, in half-travels from center; positive while gaining speed
 };
 
@@ -102,6 +103,20 @@ struct ForceSettings
     /** Frequency of both shakes, Hz. Low: these are a couple of lurches, not a buzz. */
     double bumpShakeHz = 7.0;
 
+    // The machine's own movement, as seen from the seat when the cab sways against the horizon
+    // off road: the wheel is pushed as the body rocks, the yoke as it pitches and bounces. These
+    // follow what the body does, so a heavy machine that barely moves barely shows them.
+
+    /** Force on roll with the body rocking sideways at bodyRockFullRate, 0..1. */
+    double bodyRock = 0.30;
+    /** Rocking rate that gives all of bodyRock, rad/s. A tractor on a rough field rocks at 0.2 to 0.3. */
+    double bodyRockFullRate = 0.5;
+    /** Force on pitch with the body pitching and bouncing at the two rates below, 0..1. Pitch needs a lot before it moves. */
+    double bodyBounce = 0.60;
+    /** Pitching rate, rad/s, and vertical acceleration, m/s^2, that each give half of bodyBounce. */
+    double bodyPitchFullRate = 0.4;
+    double bodyHeaveFull     = 5.0;
+
     // Rumble.
 
     /** Strength on the roughest surface (rough = 1) at and above rumbleFullSpeed, 0..1. */
@@ -119,12 +134,28 @@ struct ForceSettings
     /** Speed at which the rumble frequency reaches rumbleMaxHz, m/s. */
     double rumbleHzFullSpeed = 12.0;
     /**
-     * Engine vibration at full load while the engine turns, 0..1, at crankshaft frequency (rpm / 60)
-     * held inside the rumble band. Off by default: it is the only rumble present at standstill.
+     * Engine vibration with the engine flat out, under full load, at speed, 0..1. Off by default:
+     * it is the only rumble present at standstill. How much of it there is at any moment, and how
+     * fast it shakes, follow the engine's speed above all, then its load and the machine's pace.
      */
     double engineRumble = 0.0;
-    /** Fraction of engineRumble left at zero engine load, 0..1. */
+    /** Fraction of engineRumble left with the engine idling, unloaded, at a standstill, 0..1. */
     double engineRumbleIdleShare = 0.5;
+    /**
+     * What the rest is made of. Each is a share of the way from idle to full: engine speed between
+     * this machine's idle and maximum, engine load, and road speed up to rumbleFullSpeed.
+     */
+    double engineRumbleRevShare   = 0.50;
+    double engineRumbleLoadShare  = 0.25;
+    double engineRumbleSpeedShare = 0.25;
+    /**
+     * The frequency runs from the slow end of the rumble band at idle to the fast end flat out;
+     * this much of that climb comes from road speed rather than engine speed, 0..1.
+     */
+    double engineHzSpeedShare = 0.20;
+    /** Idle and maximum engine speed assumed for a machine that does not report its own, 1/min. */
+    double engineIdleRpm = 850.0;
+    double engineFullRpm = 2200.0;
     /**
      * Shake while a combustion engine is being started, 0..1: the starter cranking and the engine
      * catching. It comes on top of rumbleMax rather than under it, because the point of it is to
@@ -133,8 +164,20 @@ struct ForceSettings
     double engineStartShake = 0.6;
     /** Frequency of the start-up shake, Hz, held inside the rumble band. Cranking is slow and lumpy. */
     double engineStartHz = 9.0;
-    /** How long the start-up shake takes to die away once the engine is running, seconds. */
-    double engineStartFadeSeconds = 0.8;
+    /**
+     * How much of the machine's own start the shake lasts for, 0..1, from the start being triggered
+     * to the end of its dying away. Each machine takes its own time to start (the game goes by the
+     * length of its start sound) and says so; the shake makes its point in part of that. 1 lasts
+     * the whole start.
+     */
+    double engineStartShare = 0.5;
+    /**
+     * Longest the shake lasts, seconds, on a machine whose start time the game does not give.
+     * 0 lets it last as long as the game keeps the engine starting.
+     */
+    double engineStartSeconds = 1.5;
+    /** How long the start-up shake takes to die away, seconds; never more than half of its length. */
+    double engineStartFadeSeconds = 0.4;
 
     // Surfaces. Each kind of ground has its own pattern of rumble (see kPatterns in
     // force_model.cpp): where in the frequency band it sits, how lumpy it is, whether it pulses
@@ -253,6 +296,9 @@ private:
     ForceOutput   m_output;
     /** 1 while the engine is being started, then falling to 0 over engineStartFadeSeconds. */
     double m_startShake = 0.0;
+    /** Whether the last sample was of an engine being started, and for how long that has been so. */
+    bool   m_starting     = false;
+    double m_startElapsed = 0.0;
 
     // The last telemetry sample the acceleration estimate was advanced with.
     bool          m_haveSpeed    = false;

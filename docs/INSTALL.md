@@ -96,11 +96,19 @@ it is a motor, and the test options move it on their own.
   the small pulls on the wheel on rough fields. Asphalt starts at nothing. *Live status* shows which
   surface the game reports. *A different feel for each surface* switches
   it all back to one plain rumble.
-- **Engine start:** *Engine start shake* sets how hard the wheel shakes while a combustion engine
-  is being started. Electric vehicles have no engine vibration at all, only the ground's.
+- **Engine:** *Engine vibration* is gentle and slow at idle and grows stronger and faster with the
+  revs, the load and the speed; *Engine vibration at idle* sets how much is left at a standstill.
+  *Engine start shake* sets how hard the wheel shakes while a combustion engine is being started,
+  and *Engine start shake length* for how much of the machine's own start it lasts (each machine
+  takes its own time; *Live status* shows it). Electric vehicles have no engine vibration at all,
+  only the ground's.
 - **Bumps:** *Obstacle kick* jerks the wheel toward the side whose front wheel hits something;
   *Thump* and *Wiggle* shake it when both front wheels hit together, as on rail tracks. Heavier
   machines get less kick and wiggle.
+- **Machine movement:** off road the machine rocks and bounces under you, and the yoke follows:
+  *Rocking* pushes the wheel left and right as the body sways from side to side, and *Pitching and
+  bouncing* pushes the yoke in and out. *Live status* shows what the game reports for all three.
+  The in-and-out push needs a fair amount before the yoke moves at all.
 - **Acceleration:** *Acceleration sway* leans the yoke out when you pull away and in when you
   brake. If it leans the wrong way, turn on *Reverse acceleration sway*; set it to 0 to switch it off.
 - **Lights:** *Lights follow the engine* (off by default) dims the yoke handle's lights with the
